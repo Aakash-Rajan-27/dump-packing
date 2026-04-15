@@ -29,7 +29,7 @@ from core.filters   import get_candidates
 from core.scoring   import score_candidates
 from core.mcts      import mcts_select_dump_points
 from core.assignment import assign
-from core.pathfinder impo   rt plan_paths   # swap to plan_paths_cbs in week 2
+from core.pathfinder import   rt plan_paths   # swap to plan_paths_cbs in week 2
 from viz.renderer   import Renderer
 
 
