@@ -23,14 +23,14 @@ from scipy.ndimage import gaussian_filter   # for pheromone spatial spreading
 from config import (POLYGON_BOUNDARY, ENTRY_POINT, CELL_SIZE,
                     NUM_TRUCKS, TICK_DELAY, PYGAME_SCALE,
                     PHEROMONE_DECAY, PHEROMONE_SPREAD_SIGMA)
-from core.grid_map  import GridMap, CellState
-from core.truck     import Truck
-from core.filters   import get_candidates
-from core.scoring   import score_candidates
-from core.mcts      import mcts_select_dump_points
-from core.assignment import assign
-from core.pathfinder import   rt plan_paths   # swap to plan_paths_cbs in week 2
-from viz.renderer   import Renderer
+import grid_map
+from truck     import Truck
+from filters   import get_candidates
+from scoring   import score_candidates
+from mcts      import mcts_select_dump_points
+from assignment import assign
+from pathfinder import plan_paths   # swap to plan_paths_cbs in week 2
+from renderer   import Renderer
 
 
 def run_simulation():
@@ -38,15 +38,15 @@ def run_simulation():
 
     # ── Initialise world ───────────────────────────────────
     print("Initialising grid...")
-    grid = GridMap(POLYGON_BOUNDARY, CELL_SIZE)
+    grid = grid_map.GridMap(POLYGON_BOUNDARY, CELL_SIZE)
 
     # Count how many valid cells we have
-    valid_cells = np.sum(grid.state == CellState.EMPTY)
+    valid_cells = np.sum(grid.state == grid_map.CellState.EMPTY)
     print(f"Grid: {grid.rows}×{grid.cols} cells, {valid_cells} valid dump cells")
 
     # Find the entry point cell (used as flood-fill root)
     entry_rc = grid.world_to_cell(*ENTRY_POINT)
-    print(f"Entry point: world{ENTRY_POINT} → cell{entry_rc}")
+    print(f"Entry point: world{ENTRY_POINT} -> cell{entry_rc}")
 
     # ── Create trucks ──────────────────────────────────────
     # All trucks start at the entry point, idle
@@ -156,7 +156,7 @@ def run_simulation():
     print(f"Total ticks: {tick}")
     print(f"Final fill:  {grid.fill_pct()*100:.1f}%")
 
-    filled_count = np.sum(grid.state == CellState.FILLED)
+    filled_count = np.sum(grid.state == grid_map.CellState.FILLED)
     print(f"Cells filled: {filled_count}")
     print(f"Autonomous baseline spacing: 7.38m")
     print(f"Staffed target spacing:      3.03m")
