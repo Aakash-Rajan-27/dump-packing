@@ -30,6 +30,8 @@ def build_cost_matrix(trucks, dump_points, grid):
       - normalised distance (primary factor)
       - normalised heading misalignment (secondary factor)
 
+#FIX -> <add truck - point compatability, e.g. small trucks prefer low spots>
+
     trucks: list of Truck objects
     dump_points: list of (row, col) candidate dump cells
     grid: GridMap (for cell_to_world conversion)
