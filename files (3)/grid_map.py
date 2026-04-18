@@ -74,7 +74,8 @@ class GridMap:
         # Mark the entry corridor as PROTECTED so it never gets dumped on
         self._mark_entry_corridor()
 
-    def _classify_cells(self):
+    def _classify_cells(self):#FIX THIS - CONSIDERS ONLY XY POSITION OF CELL CENTER AND CHECKS IF INSIDE BOUNDARY OR NO  
+                                #IT SHOULD CHECK ALL 4 EXTREMES OF THE SQUARE CELL IF INSIDE BOUNDARY OR NO
         """
         Loop over every cell, find its real-world centre coordinate,
         and test whether it's inside the polygon.
@@ -159,7 +160,7 @@ class GridMap:
 
         # Increase height based on payload (simplified — real calc uses volume)
         from config import CELL_SIZE, TARGET_PILE_HEIGHT
-        self.z_height[r, c] += truck_payload * 0.1  # scale factor
+        self.z_height[r, c] += truck_payload * 0.1  # scale factor#FIX - HOW WE KNOW EXACT SCALING FACTOR BASED ON PAYLOAD
 
         # Clamp height so it doesn't exceed the physical target
         self.z_height[r, c] = min(self.z_height[r, c], TARGET_PILE_HEIGHT)

@@ -56,7 +56,7 @@ def score_candidates(grid, candidate_idxs):
 
     # Exponential decay: score is 1.0 right next to a pile, drops off fast.
     # spread = half the dump spread radius → controls how quickly score drops
-    spread = grid.cell_size * 2
+    spread = grid.cell_size * 2#FIX - HOW DID WE DEICDE SPREAD SHUD BE 2 TIMES CELL SIZE
     density_score = np.exp(-dist_to_pile_m / spread)
     # Result: 1.0 adjacent to pile, ~0.37 at 1 spread distance, ~0 far away
 
@@ -66,7 +66,7 @@ def score_candidates(grid, candidate_idxs):
     #
     # uniform_filter computes a local average in an 8×8 cell sliding window.
     # This gives us the fraction of cells filled in each neighbourhood.
-    zone_fill_pct = uniform_filter(filled_mask.astype(float), size=8)
+    zone_fill_pct = uniform_filter(filled_mask.astype(float), size=8)# FIX - DECIDE REGION SIZE FOR SEEING ZONE FILL PCT
     # zone_fill_pct[r,c] ≈ fraction of 8×8 neighbourhood that is filled
 
     # Coverage score: high where zone is LESS full (1 - fill%)
@@ -79,7 +79,7 @@ def score_candidates(grid, candidate_idxs):
     # Goal: level out depressions in the dump surface.
     #
     # uniform_filter on z_height gives average height of each cell's neighbourhood
-    avg_neighbour_height = uniform_filter(grid.z_height, size=3)
+    avg_neighbour_height = uniform_filter(grid.z_height, size=3)# FIX - DECIDE SIZE OF NEIGHBOURHOOD TO TAKE
 
     # Depression = how much lower this cell is vs its neighbours
     # max(0,...) ensures we only score actual depressions, not hills
@@ -130,7 +130,7 @@ def score_candidates(grid, candidate_idxs):
     # Early on: spread out (coverage matters most)
     # Late on: pack tight (density matters most)
     fp = grid.fill_pct()  # 0.0 to 1.0
-
+                                         #FIX -- ADAPTIVE WEIGHTS 
     if fp < 0.30:
         w = WEIGHTS_EARLY   # [density, coverage, lowspot, pheromone, boundary]
     elif fp < 0.70:

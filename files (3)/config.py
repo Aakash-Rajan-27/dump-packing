@@ -59,5 +59,5 @@ WEIGHTS_LATE   = [0.4, 0.1, 0.3, 0.1, 0.1]  # fill > 70%: pack tight
 # ── Simulation settings ────────────────────────────────────
 NUM_TRUCKS   = 4       # how many trucks in the fleet
 TICK_DELAY   = 0.05   # seconds between simulation ticks (controls animation speed)
-PYGAME_SCALE = 8       # pixels per cell in the pygame window
+PYGAME_SCALE = 15       # pixels per cell in the pygame window
                         # 8 means each 3m cell = 8×8 pixels on screen

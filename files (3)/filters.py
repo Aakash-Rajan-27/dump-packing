@@ -56,7 +56,7 @@ def footprint_ok(grid, r, c, truck):
 
     # Check every corner is inside the polygon
     for corner_x, corner_y in corners:
-        if not grid.polygon.contains(Point(corner_x, corner_y)):
+        if not grid.polygon.contains(Point(corner_x, corner_y)): #FIX - KEEP EXTRA GAP WITH BOUNDAY AS BUFFER, ALSO THIS IS JUST SUBSET OF TURNING RADIUS CHECK??
             return False  # this corner is outside — reject this cell
 
     return True  # all 4 corners are inside — this cell is valid

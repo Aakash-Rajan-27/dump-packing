@@ -71,7 +71,7 @@ class Renderer:
         pygame.display.set_caption("Optimal Dump Packing Simulation")
 
         # Create the window: grid area + metrics panel side by side
-        self.screen = pygame.display.set_mode((grid_pixel_w + panel_w, grid_pixel_h))
+        self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
 
         # Font for drawing text in the metrics panel
         self.font_large = pygame.font.SysFont('monospace', 16, bold=True)
