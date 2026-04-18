@@ -129,11 +129,11 @@ class Truck:
                     r, c = self.dump_target
                     grid.dump_at(r, c, self.payload)  # marks FILLED, updates height
                     self.dump_target = None
-
                 # Now head back to the entry corridor
                 self.status = self.STATUS_EXITING
                 # In a full system we'd plan a path back.
                 # For now: teleport back to entry (simplification for week 1)
+                #FIX -> <plan path back to entry point>
                 from config import ENTRY_POINT
                 self.pos = list(ENTRY_POINT)
                 self.status = self.STATUS_IDLE  # ready for next assignment
