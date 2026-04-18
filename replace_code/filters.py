@@ -16,44 +16,50 @@ from grid_map import CellState
 
 def footprint_ok(grid, r, c, truck):
     """
-    Check that a truck CAN dump at cell (r,c) from SOME approach angle.
-    We test 4 cardinal headings (N/S/E/W) and pass if ANY orientation fits.
-
-    This avoids falsely rejecting cells just because the truck's CURRENT
-    heading doesn't align — what matters is whether the cell is physically
-    reachable at all, not the instantaneous heading.
+    Check that when the truck reverses to dump at cell (r,c),
+    every corner of the truck body stays inside the polygon.
 
     grid: GridMap
     r,c: the target dump cell
-    truck: Truck object (has .width, .length)
+    truck: Truck object (has .width, .length, .heading)
 
-    Returns True if the truck fits from at least one approach angle.
+    Returns True if the truck fits, False if it sticks outside.
     """
+    # Get the real-world centre of the target cell
     cx, cy = grid.cell_to_world(r, c)
-    half_w = truck.width / 2.0
-    half_l = truck.length / 2.0
 
-    # Test 4 candidate headings: 0°, 90°, 180°, 270°
-    # A cell is valid if the truck fits from ANY of these directions
-    for heading in [0, np.pi/2, np.pi, 3*np.pi/2]:
-        reverse_heading = heading + np.pi
-        fwd_x = np.cos(heading)
-        fwd_y = np.sin(heading)
-        side_x = fwd_y
-        side_y = -fwd_x
+    # Truck reverses to dump — its REAR end is at (cx, cy).
+    # We need to check that the full truck rectangle fits.
+    half_w = truck.width / 2.0    # half-width in metres
+    half_l = truck.length / 2.0   # half-length in metres
 
-        corners = []
-        for length_sign in [-1, +1]:
-            for width_sign in [-1, +1]:
-                corner_x = cx + length_sign * half_l * fwd_x + width_sign * half_w * side_x
-                corner_y = cy + length_sign * half_l * fwd_y + width_sign * half_w * side_y
-                corners.append((corner_x, corner_y))
+    # The truck heading when reversing is the OPPOSITE of its forward heading.
+    # heading is in radians. Reversing direction = heading + π
+    reverse_heading = truck.heading + np.pi
 
-        # If ALL corners fit for this heading, the cell is valid
-        if all(grid.polygon.contains(Point(cx2, cy2)) for cx2, cy2 in corners):
-            return True
+    # Direction vectors along and across the truck body
+    # fwd = unit vector pointing forward (along truck length)
+    fwd_x = np.cos(truck.heading)
+    fwd_y = np.sin(truck.heading)
+    # side = unit vector pointing to the right of the truck
+    side_x = fwd_y   # perpendicular to fwd (rotate 90°)
+    side_y = -fwd_x
 
-    return False  # no orientation works — cell is too close to boundary
+    # Calculate the 4 corners of the truck rectangle:
+    # rear-left, rear-right, front-left, front-right
+    corners = []
+    for length_sign in [-1, +1]:        # rear = -1, front = +1
+        for width_sign in [-1, +1]:     # left = -1, right = +1
+            corner_x = cx + length_sign * half_l * fwd_x + width_sign * half_w * side_x
+            corner_y = cy + length_sign * half_l * fwd_y + width_sign * half_w * side_y
+            corners.append((corner_x, corner_y))
+
+    # Check every corner is inside the polygon
+    for corner_x, corner_y in corners:
+        if not grid.polygon.contains(Point(corner_x, corner_y)):
+            return False  # this corner is outside — reject this cell
+
+    return True  # all 4 corners are inside — this cell is valid
 
 
 def is_accessible(grid, r, c, entry_rc):
@@ -139,11 +145,19 @@ def get_candidates(grid, truck, entry_rc):
     # Zip them into (row, col) pairs
     all_empty = list(zip(empty_rows.tolist(), empty_cols.tolist()))
 
-    # Apply footprint filter only here (fast — no flood-fill per cell).
-    # Accessibility (flood-fill) is expensive: main.py applies it on top-N only.
+    # Apply filters — keep only cells that pass BOTH checks
     valid = []
     for r, c in all_empty:
-        if footprint_ok(grid, r, c, truck):
-            valid.append((r, c))
+        # Filter 1: truck body must stay inside polygon
+        if not footprint_ok(grid, r, c, truck):
+            continue    # skip this cell
+
+        # Filter 2: must not isolate any region (flood fill check)
+        # Note: this is expensive for every cell — in production we'd only
+        # run this on the top-N scored candidates. For now, run on all.
+        if not is_accessible(grid, r, c, entry_rc):
+            continue    # skip this cell
+
+        valid.append((r, c))  # this cell passed all filters!
 
     return valid
