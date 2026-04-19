@@ -31,7 +31,7 @@ MIN_TURN_RADIUS = 12.0  # minimum turning radius in metres
                          # (tighter turns than this are physically impossible)
 
 # ── Dump pile physics ──────────────────────────────────────
-DUMP_SPREAD_RADIUS = 4.0   # how far material spreads from dump point (metres)
+DUMP_SPREAD_RADIUS = 4.0    # how far material spreads from dump point (metres)
 TARGET_PILE_HEIGHT = 3.0   # target height of a full pile (metres)
 ANGLE_OF_REPOSE    = 35.0  # degrees — slope of a pile edge (30–40 is real)
 
@@ -59,5 +59,5 @@ WEIGHTS_LATE   = [0.4, 0.1, 0.3, 0.1, 0.1]  # fill > 70%: pack tight
 # ── Simulation settings ────────────────────────────────────
 NUM_TRUCKS   = 4       # how many trucks in the fleet
 TICK_DELAY   = 0.05   # seconds between simulation ticks (controls animation speed)
-PYGAME_SCALE = 15       # pixels per cell in the pygame window
+PYGAME_SCALE = 30      # pixels per cell in the pygame window
                         # 8 means each 3m cell = 8×8 pixels on screen
