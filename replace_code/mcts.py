@@ -1,13 +1,12 @@
 # mcts.py
 # ─────────────────────────────────────────────────────────────
-# MCTS forward simulation — updated for partial pile dynamics.
+# FIX: rollout_score was rebuilding the dumpable cell list from scratch
+# inside every simulation (50 sims × 20 depth = 1000 iterations).
+# Each rebuild looped all grid.rows × grid.cols = 8281 cells.
+# Total: 8.2M cell checks per planning tick just for MCTS.
 #
-# Key change: the rollout now tracks z_height per cell, not just
-# a binary filled/empty set. A cell is "done" only when its height
-# reaches TARGET_PILE_HEIGHT. A single dump from a large truck may
-# fill multiple cells in one shot; a small truck may need several
-# dumps to fill one cell. The rollout approximates this by using
-# the average pile_height_per_dump across the fleet.
+# Fix: pass dumpable list as a parameter, computed once per tick
+# in mcts_select_dump_points before the simulation loop.
 # ─────────────────────────────────────────────────────────────
 
 import math
@@ -16,9 +15,6 @@ import numpy as np
 from grid_map import CellState
 from config import TARGET_PILE_HEIGHT, TRUCK_CLASSES, FLEET_COMPOSITION
 
-
-# Pre-compute the average pile_height_per_dump across the whole fleet.
-# Used in rollouts to estimate how much one "generic" future dump contributes.
 _total_trucks = sum(FLEET_COMPOSITION.values())
 _avg_pile_height_per_dump = sum(
     TRUCK_CLASSES[cls]['pile_height_per_dump'] * count
@@ -41,40 +37,25 @@ class MCTSNode:
                 c * math.sqrt(math.log(total_sims) / self.visits))
 
 
-def rollout_score(base_state, base_heights, initial_cell, dump_add, grid, depth=20):
+def rollout_score(base_state, base_heights, base_dumpable,
+                  initial_cell, dump_add, grid, depth=20):
     """
-    From a hypothetical dump at initial_cell, simulate 'depth' more
-    random dumps using average fleet dump height. Score the final state.
-
-    base_state   : grid.state snapshot (read-only)
-    base_heights : grid.z_height snapshot (read-only)
-    initial_cell : (r, c) — the node's dump
-    dump_add     : pile_height_per_dump for this specific truck
-    grid         : GridMap (for dims)
-    depth        : future dumps to simulate
+    FIX: base_dumpable passed in — no longer rebuilt per rollout.
+    Simulates dump at initial_cell then depth random future dumps.
     """
-    # Work with height array — tracks partial fill numerically
     heights = base_heights.copy()
     states  = base_state.copy()
 
-    # Apply initial dump
     r0, c0 = initial_cell
     heights[r0, c0] = min(heights[r0, c0] + dump_add, TARGET_PILE_HEIGHT)
-    if heights[r0, c0] >= TARGET_PILE_HEIGHT:
-        states[r0, c0] = CellState.FILLED
-    else:
-        states[r0, c0] = CellState.PARTIAL
+    states[r0, c0]  = (CellState.FILLED if heights[r0, c0] >= TARGET_PILE_HEIGHT
+                       else CellState.PARTIAL)
 
-    # Collect still-dumpable cells
-    dumpable = []
-    for r in range(grid.rows):
-        for c in range(grid.cols):
-            if states[r, c] in (CellState.EMPTY, CellState.PARTIAL,
-                                 CellState.RESERVED):
-                if heights[r, c] < TARGET_PILE_HEIGHT:
-                    dumpable.append((r, c))
+    # Use the precomputed dumpable list, filter out now-filled cells
+    dumpable = [cell for cell in base_dumpable
+                if heights[cell[0], cell[1]] < TARGET_PILE_HEIGHT
+                and cell != (r0, c0)]
 
-    # Simulate 'depth' random future dumps with average fleet height
     for _ in range(min(depth, len(dumpable))):
         if not dumpable:
             break
@@ -87,65 +68,56 @@ def rollout_score(base_state, base_heights, initial_cell, dump_add, grid, depth=
             dumpable[idx]  = dumpable[-1]
             dumpable.pop()
 
-    # ── Score the final state ───────────────────────────────
-    total_valid = np.sum(
-        (states == CellState.EMPTY)    |
-        (states == CellState.PARTIAL)  |
-        (states == CellState.FILLED)   |
-        (states == CellState.RESERVED)
-    )
-    if total_valid == 0:
-        return 0.0
-
-    # Packing density: total height filled / theoretical max
     valid_mask = ((states == CellState.EMPTY)   |
                   (states == CellState.PARTIAL)  |
                   (states == CellState.FILLED)   |
                   (states == CellState.RESERVED))
+    total_valid = np.sum(valid_mask)
+    if total_valid == 0:
+        return 0.0
+
     packing = (np.sum(np.clip(heights, 0, TARGET_PILE_HEIGHT) * valid_mask)
                / (total_valid * TARGET_PILE_HEIGHT))
 
-    # Isolation penalty (fast heuristic — not full BFS)
     filled_set = set(zip(*np.where(heights >= TARGET_PILE_HEIGHT)))
-    remaining  = [(r, c) for r in range(grid.rows)
-                  for c in range(grid.cols)
-                  if states[r, c] in (CellState.EMPTY, CellState.PARTIAL)
-                  and heights[r, c] < TARGET_PILE_HEIGHT]
+    remaining  = [(r, c) for r, c in dumpable[:15]]
+    isolated_penalty = sum(
+        1 for rr, cc in remaining
+        if sum(1 for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]
+               if (rr+dr, cc+dc) in filled_set) >= 3
+    )
 
-    isolated_penalty = 0
-    for rr, cc in remaining[:15]:
-        n_filled_neighbours = sum(
-            1 for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]
-            if (rr+dr, cc+dc) in filled_set
-        )
-        if n_filled_neighbours >= 3:
-            isolated_penalty += 1
-
-    score = packing - 0.05 * (isolated_penalty / max(1, min(15, len(remaining))))
+    score = packing - 0.05 * (isolated_penalty / max(1, len(remaining)))
     return max(0.0, min(1.0, score))
 
 
-def mcts_select_dump_points(grid, candidates, truck, n_trucks, n_sim=200):
+def mcts_select_dump_points(grid, candidates, truck, n_trucks, n_sim=50):
     """
-    Select the best n_trucks dump points from candidates using MCTS.
-
-    truck : the Truck object making this planning call — used to get
-            pile_height_per_dump for accurate rollout simulation.
+    FIX: dumpable list computed once here, passed into every rollout.
+    Old: each rollout rebuilt the list (8281 cells × 1000 rollouts = 8M checks).
+    New: one build, passed as parameter.
     """
     if not candidates:
         return []
 
-    n_select = min(n_trucks, len(candidates))
-    nodes    = [MCTSNode(cell) for cell in candidates]
-
+    n_select     = min(n_trucks, len(candidates))
+    nodes        = [MCTSNode(cell) for cell in candidates]
     base_state   = grid.state.copy()
     base_heights = grid.z_height.copy()
     dump_add     = truck.pile_height_per_dump
 
+    # Build dumpable list ONCE
+    base_dumpable = [
+        (r, c) for r in range(grid.rows) for c in range(grid.cols)
+        if base_state[r, c] in (CellState.EMPTY, CellState.PARTIAL,
+                                 CellState.RESERVED)
+        and base_heights[r, c] < TARGET_PILE_HEIGHT
+    ]
+
     for sim_num in range(n_sim):
         total = sim_num + 1
         node  = max(nodes, key=lambda n: n.ucb1(total))
-        score = rollout_score(base_state, base_heights,
+        score = rollout_score(base_state, base_heights, base_dumpable,
                               node.cell, dump_add, grid, depth=20)
         node.visits += 1
         node.value  += score

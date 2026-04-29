@@ -1,54 +1,115 @@
 # renderer.py
 # ─────────────────────────────────────────────────────────────
-# Pygame visualiser. Updated for mixed fleet and partial piles:
-#   - PARTIAL cells drawn in a distinct orange-brown colour
-#     with brightness proportional to how full they are
-#   - Truck circles sized proportional to truck class
-#   - Panel shows per-truck class label (S/M/L) and status
+# Changes from previous version:
+#
+# 1. Auto-scale accounts for fine grid (181x181 at 0.5m)
+#    Old: scale = screen_h * 0.85 / grid.rows
+#         At 31 rows: scale=21px/cell (each cell = 21px = 3m)
+#    New: same formula, but grid.rows=181 at 0.5m cells
+#         scale = 768*0.85/181 = 3.6 → rounded to max(2, ...)
+#         Each 0.5m cell = 3-4px → groups of 6 cells = one old 3m cell = 18-24px
+#    Physical truck dimensions still correct because world_to_px uses metres.
+#
+# 2. _draw_grid() — height map visualisation improved
+#    Old: simple colour blend per state
+#    New: uses z_height directly for colour intensity on ALL material cells
+#         (both PARTIAL and FILLED). This gives a true continuous height map
+#         appearance — cells smoothly darken from green→orange→brown as they fill.
+#         At 0.5m resolution this produces a smooth gradient across the polygon.
+#
+# 3. All other drawing (trucks, panel, dump radii) unchanged —
+#    world_to_px uses real metres so scales automatically.
 # ─────────────────────────────────────────────────────────────
 
 import pygame
 import numpy as np
+import math
 from grid_map import CellState
-from config import TARGET_PILE_HEIGHT
+from config import TARGET_PILE_HEIGHT, _TAN_REPOSE
 
 CELL_COLOURS = {
-    CellState.BOUNDARY:  ( 30,  30,  30),   # dark grey
-    CellState.EMPTY:     (140, 190, 140),   # soft green
-    CellState.PARTIAL:   (200, 140,  60),   # orange-brown (partial fill)
-    CellState.FILLED:    (110,  70,  30),   # dark brown (full pile)
-    CellState.RESERVED:  (230, 180,  50),   # yellow
-    CellState.PROTECTED: ( 80, 120, 200),   # blue
-    CellState.OBSTACLE:  (200,  50,  50),   # red
+    CellState.BOUNDARY:  ( 30,  30,  30),
+    CellState.EMPTY:     (140, 190, 140),
+    CellState.PARTIAL:   (200, 140,  60),
+    CellState.FILLED:    (110,  70,  30),
+    CellState.RESERVED:  (230, 180,  50),
+    CellState.PROTECTED: ( 80, 120, 200),
+    CellState.OBSTACLE:  (200,  50,  50),
 }
 
+PANEL_W  = 280
 PANEL_BG = (20, 20, 30)
+
+# Colour keyframes for height-based blending:
+# z=0 → green (EMPTY), z=mid → orange (PARTIAL), z=full → dark brown (FILLED)
+_COL_EMPTY   = np.array([140, 190, 140], dtype=float)
+_COL_PARTIAL = np.array([200, 140,  60], dtype=float)
+_COL_FILLED  = np.array([110,  70,  30], dtype=float)
+
+
+def _height_colour(z_norm):
+    """
+    Map normalised height z_norm ∈ [0,1] to RGB tuple.
+    0.0 → green (empty), 0.5 → orange (partial), 1.0 → dark brown (full).
+    Uses two-segment linear blend for smooth gradient.
+    """
+    if z_norm <= 0.5:
+        t = z_norm * 2.0
+        rgb = _COL_EMPTY + t * (_COL_PARTIAL - _COL_EMPTY)
+    else:
+        t = (z_norm - 0.5) * 2.0
+        rgb = _COL_PARTIAL + t * (_COL_FILLED - _COL_PARTIAL)
+    return tuple(int(v) for v in np.clip(rgb, 0, 255))
 
 
 class Renderer:
-    def __init__(self, grid, scale=8):
-        self.grid  = grid
-        self.scale = scale
-
-        grid_pixel_w = grid.cols * scale
-        grid_pixel_h = grid.rows * scale
-        panel_w      = 240
-
-        self.grid_w = grid_pixel_w
-        self.grid_h = grid_pixel_h
+    def __init__(self, grid, scale=None):
+        self.grid = grid
 
         pygame.init()
-        pygame.display.set_caption("Optimal Dump Packing — Mixed Fleet Simulation")
-        self.screen       = pygame.display.set_mode(
-            (grid_pixel_w + panel_w, grid_pixel_h))
-        self.font_large   = pygame.font.SysFont('monospace', 16, bold=True)
-        self.font_small   = pygame.font.SysFont('monospace', 13)
-        self.grid_surface = pygame.Surface((grid_pixel_w, grid_pixel_h))
+        info = pygame.display.Info()
+        screen_h = info.current_h
+        screen_w = info.current_w
+
+        if scale is None:
+            # CHANGED: max(2,...) instead of max(8,...) to handle fine grid
+            # At 181 rows and 768px screen: scale = int(768*0.85/181) = 3
+            self.scale = max(2, int(screen_h * 0.85) // grid.rows)
+        else:
+            self.scale = scale
+
+        self.grid_w = grid.cols * self.scale
+        self.grid_h = grid.rows * self.scale
+
+        win_w = min(self.grid_w + PANEL_W, screen_w)
+        win_h = min(self.grid_h, screen_h)
+
+        pygame.display.set_caption("Optimal Dump Packing — Mixed Fleet")
+        self.screen = pygame.display.set_mode(
+            (win_w, win_h), pygame.RESIZABLE
+        )
+
+        self.font_large = pygame.font.SysFont('monospace', 16, bold=True)
+        self.font_small = pygame.font.SysFont('monospace', 13)
+        self.font_tiny  = pygame.font.SysFont('monospace', 11)
+
+        self.grid_surface = pygame.Surface((self.grid_w, self.grid_h))
+        self.m_per_px = grid.cell_size / self.scale
+
+    def world_to_px(self, x, y):
+        ox, oy = self.grid.origin
+        px = int((x - ox) / self.m_per_px)
+        py = int((y - oy) / self.m_per_px)
+        return px, py
+
+    def metres_to_px(self, metres):
+        return max(1, int(metres / self.m_per_px))
 
     def draw(self, trucks=None, metrics=None):
         if trucks  is None: trucks  = []
         if metrics is None: metrics = {}
         self._draw_grid()
+        self._draw_dump_radii(trucks)
         for truck in trucks:
             self._draw_truck(truck)
         self.screen.blit(self.grid_surface, (0, 0))
@@ -56,91 +117,156 @@ class Renderer:
         pygame.display.flip()
 
     def _draw_grid(self):
+        """
+        CHANGED: height-map based colouring for material cells.
+        Old: separate colour logic for PARTIAL vs FILLED states
+        New: any cell with z_height > 0 gets colour from _height_colour(z/TARGET)
+             producing a smooth continuous gradient across the fine grid.
+             At 0.5m resolution this is visually smooth like a real height map.
+        """
         g = self.grid
         s = self.scale
 
+        # Pre-compute normalised height array for all cells
+        z_norm = np.clip(g.z_height / TARGET_PILE_HEIGHT, 0.0, 1.0)
+
         for r in range(g.rows):
             for c in range(g.cols):
-                state  = g.state[r, c]
-                colour = CELL_COLOURS.get(state, (50, 50, 50))
+                state = g.state[r, c]
 
-                if state == CellState.FILLED:
-                    # Darker = higher pile
-                    ratio  = min(1.0, g.z_height[r, c] / TARGET_PILE_HEIGHT)
-                    colour = tuple(int(v * (1.0 - 0.35 * ratio)) for v in colour)
+                if state == CellState.BOUNDARY:
+                    colour = CELL_COLOURS[CellState.BOUNDARY]
 
-                elif state == CellState.PARTIAL:
-                    # Brightness proportional to partial fill fraction
-                    ratio  = min(1.0, g.z_height[r, c] / TARGET_PILE_HEIGHT)
-                    # Blend from green (empty) toward orange-brown (partial)
-                    empty_c  = CELL_COLOURS[CellState.EMPTY]
-                    partial_c = colour
-                    colour = tuple(
-                        int(empty_c[i] + ratio * (partial_c[i] - empty_c[i]))
-                        for i in range(3)
-                    )
+                elif state in (CellState.PARTIAL, CellState.FILLED):
+                    # CHANGED: use continuous height-based colour
+                    colour = _height_colour(z_norm[r, c])
 
                 elif state == CellState.EMPTY:
                     ph    = g.pheromone[r, c]
-                    r_val = min(255, int(colour[0] + (1 - ph) * 50))
-                    g_val = max(0,   int(colour[1] - (1 - ph) * 25))
-                    colour = (r_val, g_val, colour[2])
+                    base  = CELL_COLOURS[CellState.EMPTY]
+                    r_val = min(255, int(base[0] + (1 - ph) * 50))
+                    g_val = max(0,   int(base[1] - (1 - ph) * 25))
+                    colour = (r_val, g_val, base[2])
+
+                else:
+                    colour = CELL_COLOURS.get(state, (50, 50, 50))
 
                 pygame.draw.rect(
                     self.grid_surface, colour,
-                    (c * s, r * s, s - 1, s - 1)
+                    (c * s, r * s, max(1, s - 1), max(1, s - 1))
                 )
 
+    def _draw_dump_radii(self, trucks):
+        for truck in trucks:
+            if truck.status != truck.STATUS_DUMPING:
+                continue
+            px, py    = self.world_to_px(*truck.pos)
+            cone_r_px = self.metres_to_px(truck.pile_height_per_dump / _TAN_REPOSE)
+            surf = pygame.Surface(
+                (cone_r_px * 2 + 2, cone_r_px * 2 + 2), pygame.SRCALPHA)
+            pygame.draw.circle(surf, (*truck.colour, 80),
+                               (cone_r_px+1, cone_r_px+1), cone_r_px)
+            pygame.draw.circle(surf, (*truck.colour, 180),
+                               (cone_r_px+1, cone_r_px+1), cone_r_px, 2)
+            self.grid_surface.blit(surf, (px-cone_r_px-1, py-cone_r_px-1))
+
     def _draw_truck(self, truck):
-        s = self.scale
-        ox, oy = self.grid.origin
+        # Real pixel dimensions from metres
+        w_px_real = self.metres_to_px(truck.width)
+        l_px_real = self.metres_to_px(truck.length)
 
-        px = int((truck.pos[0] - ox) / self.grid.cell_size * s)
-        py = int((truck.pos[1] - oy) / self.grid.cell_size * s)
+        # Cap drawn size so trucks never exceed ~80px longest dimension
+        # on screen — keeps them visible without overwhelming the grid.
+        # The cap scales with screen size but never goes below 12px.
+        max_dim = max(20, self.grid_h // 12)
+        scale_factor = min(1.0, max_dim / max(w_px_real, l_px_real))
+        w_px = max(6,  int(w_px_real * scale_factor))
+        l_px = max(10, int(l_px_real * scale_factor))
 
-        # Radius scales with truck class
-        base_radius = max(3, s // 2)
-        size_scale  = {'small': 0.8, 'medium': 1.1, 'large': 1.5}
-        radius      = int(base_radius * size_scale.get(truck.truck_class, 1.0))
+        # Build truck rectangle surface (length along x before rotation)
+        truck_surf = pygame.Surface((l_px, w_px), pygame.SRCALPHA)
 
-        # Truck body circle
-        pygame.draw.circle(self.grid_surface, truck.colour, (px, py), radius)
-        pygame.draw.circle(self.grid_surface, (255,255,255), (px, py), radius, 1)
+        # Body fill
+        pygame.draw.rect(truck_surf, truck.colour,
+                         (0, 0, l_px, w_px), border_radius=2)
+        # White outline
+        pygame.draw.rect(truck_surf, (255, 255, 255),
+                         (0, 0, l_px, w_px), 1, border_radius=2)
+        # Cab marker — darker front quarter
+        cab_w = max(3, l_px // 4)
+        cab_colour = tuple(max(0, v - 60) for v in truck.colour)
+        pygame.draw.rect(truck_surf, cab_colour,
+                         (l_px - cab_w, 0, cab_w, w_px), border_radius=1)
+        # Centre line
+        pygame.draw.line(truck_surf, (255, 255, 255),
+                         (0, w_px // 2), (l_px, w_px // 2), 1)
 
-        # Heading arrow
-        arrow_end = (
-            int(px + (radius + 4) * np.cos(truck.heading)),
-            int(py + (radius + 4) * np.sin(truck.heading))
-        )
-        pygame.draw.line(self.grid_surface, (255,255,255), (px, py), arrow_end, 2)
+        # Rotate to heading (pygame rotates CCW, heading CCW from east)
+        heading_deg = math.degrees(truck.heading)
+        rotated = pygame.transform.rotate(truck_surf, -heading_deg)
 
-        # Label: class letter + ID
-        label = self.font_small.render(
-            f"{truck.label}{truck.id}", True, (255,255,255))
-        self.grid_surface.blit(label, (px + radius + 2, py - radius))
+        px, py = self.world_to_px(*truck.pos)
+        rect = rotated.get_rect(center=(px, py))
+        self.grid_surface.blit(rotated, rect)
+
+        # Status colour ring around truck centre
+        # Green = navigating, yellow = reversing, red = dumping, grey = idle
+        status_colours = {
+            truck.STATUS_IDLE:       (120, 120, 120),
+            truck.STATUS_NAVIGATING: ( 80, 220,  80),
+            truck.STATUS_REVERSING:  (240, 200,  50),
+            truck.STATUS_DUMPING:    (240,  60,  60),
+        }
+        ring_col = status_colours.get(truck.status, (180, 180, 180))
+        ring_r   = max(4, w_px // 2 + 2)
+        pygame.draw.circle(self.grid_surface, ring_col, (px, py), ring_r, 2)
+
+        # Heading arrow — short line from truck centre in heading direction
+        # Length = half the drawn truck length, not the real length
+        arrow_len = max(8, l_px // 2 + 4)
+        tip_x = int(px + arrow_len * math.cos(truck.heading))
+        tip_y = int(py + arrow_len * math.sin(truck.heading))
+        pygame.draw.line(self.grid_surface, (255, 255, 255),
+                         (px, py), (tip_x, tip_y), 2)
+
+        # Arrowhead — two lines at ±150° from forward direction
+        # (±150° from forward = ±30° opening angle at the tip)
+        head_len = max(4, arrow_len // 3)
+        for angle_offset in (math.pi * 5/6, -math.pi * 5/6):
+            hx = int(tip_x + head_len * math.cos(truck.heading + angle_offset))
+            hy = int(tip_y + head_len * math.sin(truck.heading + angle_offset))
+            pygame.draw.line(self.grid_surface, (255, 255, 255),
+                             (tip_x, tip_y), (hx, hy), 2)
+
+        # Label above truck
+        label = self.font_tiny.render(
+            f"{truck.label}{truck.id}", True, (255, 255, 255))
+        self.grid_surface.blit(label, (px - label.get_width() // 2,
+                                       py - ring_r - 12))
 
     def _draw_panel(self, metrics, trucks):
-        panel_rect = pygame.Rect(self.grid_w, 0, 240, self.grid_h)
+        panel_x = self.grid_w
+        panel_rect = pygame.Rect(panel_x, 0, PANEL_W, self.grid_h)
         pygame.draw.rect(self.screen, PANEL_BG, panel_rect)
         pygame.draw.line(self.screen, (60,60,80),
-                         (self.grid_w, 0), (self.grid_w, self.grid_h), 1)
+                         (panel_x,0),(panel_x,self.grid_h),1)
 
         y = 14
-        title = self.font_large.render("Dump Packing — Mixed Fleet", True, (200,200,220))
-        self.screen.blit(title, (self.grid_w + 8, y)); y += 28
+        title = self.font_large.render(
+            "Dump Packing — Mixed Fleet", True, (200,200,220))
+        self.screen.blit(title, (panel_x+8, y)); y += 28
 
         pygame.draw.line(self.screen, (60,60,80),
-                         (self.grid_w+8, y), (self.grid_w+232, y), 1); y += 12
+                         (panel_x+8,y),(panel_x+PANEL_W-8,y),1); y += 12
 
         for key, val in metrics.items():
-            lbl = self.font_small.render(f"{key}:", True, (140,160,180))
+            lbl   = self.font_small.render(f"{key}:", True, (140,160,180))
             val_s = self.font_small.render(str(val), True, (220,220,255))
-            self.screen.blit(lbl,   (self.grid_w + 8,   y))
-            self.screen.blit(val_s, (self.grid_w + 130,  y))
+            self.screen.blit(lbl,   (panel_x+8,  y))
+            self.screen.blit(val_s, (panel_x+130, y))
             y += 18
 
         y += 6
-        # Fill progress bar
         fill = self.grid.fill_pct()
         pack = self.grid.pack_pct()
         for label_str, val, col in [
@@ -148,39 +274,52 @@ class Renderer:
             (f"Pack density:{pack*100:.1f}%", pack, (100,160,220)),
         ]:
             lbl = self.font_small.render(label_str, True, (180,200,180))
-            self.screen.blit(lbl, (self.grid_w + 8, y)); y += 16
-            pygame.draw.rect(self.screen, (50,60,50),
-                             (self.grid_w+8, y, 220, 10))
-            pygame.draw.rect(self.screen, col,
-                             (self.grid_w+8, y, int(220*val), 10))
+            self.screen.blit(lbl,(panel_x+8,y)); y += 16
+            pygame.draw.rect(self.screen,(50,60,50),(panel_x+8,y,PANEL_W-16,10))
+            pygame.draw.rect(self.screen,col,(panel_x+8,y,int((PANEL_W-16)*val),10))
             y += 18
 
         y += 8
-        pygame.draw.line(self.screen, (60,60,80),
-                         (self.grid_w+8, y), (self.grid_w+232, y), 1); y += 10
+        pygame.draw.line(self.screen,(60,60,80),
+                         (panel_x+8,y),(panel_x+PANEL_W-8,y),1); y += 10
 
-        # Per-truck status
         hdr = self.font_small.render("Fleet:", True, (160,160,180))
-        self.screen.blit(hdr, (self.grid_w + 8, y)); y += 16
+        self.screen.blit(hdr,(panel_x+8,y)); y += 16
 
         for truck in trucks:
-            pygame.draw.circle(self.screen, truck.colour,
-                                (self.grid_w + 18, y + 6), 5)
+            pygame.draw.rect(self.screen, truck.colour,
+                             (panel_x+8, y+2, 10, 10))
             status_txt = self.font_small.render(
                 f"{truck.label}{truck.id} [{truck.truck_class[:3]}]: {truck.status[:3]}",
-                True, (180,180,200)
-            )
-            self.screen.blit(status_txt, (self.grid_w + 28, y))
+                True, (180,180,200))
+            self.screen.blit(status_txt, (panel_x+22,y))
             y += 16
 
-        # Target reminders
         y += 8
         for txt, col in [
             ("Target:   <5.0m spacing", (100,200,100)),
             ("Baseline: 7.38m spacing", (200,120, 80)),
         ]:
             lbl = self.font_small.render(txt, True, col)
-            self.screen.blit(lbl, (self.grid_w + 8, y)); y += 18
+            self.screen.blit(lbl,(panel_x+8,y)); y += 18
+
+        y += 8
+        pygame.draw.line(self.screen,(60,60,80),
+                         (panel_x+8,y),(panel_x+PANEL_W-8,y),1); y += 10
+        legend_title = self.font_small.render("Legend:", True,(160,160,180))
+        self.screen.blit(legend_title,(panel_x+8,y)); y += 16
+
+        for state, name in [
+            (CellState.EMPTY,    "Empty"),
+            (CellState.PARTIAL,  "Partial pile"),
+            (CellState.FILLED,   "Full pile"),
+            (CellState.RESERVED, "Reserved"),
+            (CellState.PROTECTED,"Entry corridor"),
+        ]:
+            col = CELL_COLOURS[state]
+            pygame.draw.rect(self.screen, col,(panel_x+8,y+2,10,10))
+            lbl = self.font_tiny.render(name, True,(180,180,200))
+            self.screen.blit(lbl,(panel_x+22,y)); y += 16
 
     def check_quit(self):
         for event in pygame.event.get():
@@ -188,6 +327,14 @@ class Renderer:
                 return True
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 return True
+            if event.type == pygame.VIDEORESIZE:
+                new_scale = max(2, event.h // self.grid.rows)
+                if new_scale != self.scale:
+                    self.scale        = new_scale
+                    self.grid_w       = self.grid.cols * self.scale
+                    self.grid_h       = self.grid.rows * self.scale
+                    self.m_per_px     = self.grid.cell_size / self.scale
+                    self.grid_surface = pygame.Surface((self.grid_w, self.grid_h))
         return False
 
     def close(self):
