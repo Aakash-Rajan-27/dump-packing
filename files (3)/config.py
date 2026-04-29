@@ -31,7 +31,7 @@ MIN_TURN_RADIUS = 12.0  # minimum turning radius in metres
                          # (tighter turns than this are physically impossible)
 
 # ── Dump pile physics ──────────────────────────────────────
-DUMP_SPREAD_RADIUS = 4.0    # how far material spreads from dump point (metres)
+DUMP_SPREAD_RADIUS = 4.0   # how far material spreads from dump point (metres)
 TARGET_PILE_HEIGHT = 3.0   # target height of a full pile (metres)
 ANGLE_OF_REPOSE    = 35.0  # degrees — slope of a pile edge (30–40 is real)
 
