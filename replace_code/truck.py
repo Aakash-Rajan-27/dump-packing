@@ -1,17 +1,12 @@
 # truck.py
 # ─────────────────────────────────────────────────────────────
 # FIX: STATUS_EXITING now actually navigates back to entry.
-#
-# Old: after dumping, truck teleported instantly to ENTRY_POINT
-#      → visually disappeared and reappeared at entry
-#      → never showed the exit journey
-#
-# New: after dumping, truck sets an exit path back to entry_rc
-#      using its existing path mechanism, then goes IDLE on arrival.
-#      exit_path is set by set_exit_path() called from main.py
-#      after dump completes.
-#
-# Also: heading is updated during exit navigation same as forward nav.
+# FIX (CRITICAL PADDOCK BUG): "Ghost Dirt" patch. Trucks previously 
+#      dumped instantly if the pathfinder failed and returned an empty path. 
+#      Now strictly verifies physical arrival at dump_target before reversing.
+#      Before this, if a path wasn't found, an empty path will be retuned which will make the truck 
+#      think it has arrived at the dump point and start dumping, even though it's not there. 
+#    This causes "ghost dirt" to appear on the grid where the truck thinks it dumped but actually didn't.
 # ─────────────────────────────────────────────────────────────
 
 import numpy as np
@@ -47,21 +42,22 @@ class Truck:
         self.path        = []
         self.dump_target = None
         self._dump_ticks = 0
-        self._exit_path  = []   # NEW: path back to entry after dumping
+        self._exit_path  = []   
 
     def set_path(self, path, dump_target, grid):
         self.path        = list(path)
         self.dump_target = dump_target
-        self.status      = self.STATUS_NAVIGATING
+        
+        # If path is empty (pathfinder failed), abort immediately.
+        if not self.path:
+            self.status = self.STATUS_IDLE
+            return
+            
+        self.status = self.STATUS_NAVIGATING
         if dump_target:
             grid.reserve(*dump_target)
 
     def set_exit_path(self, exit_path):
-        """
-        NEW: Called from main.py after dump completes.
-        Gives the truck a path back to the entry point.
-        If path is empty (already at entry), go idle immediately.
-        """
         if exit_path:
             self._exit_path = list(exit_path)
             self.status     = self.STATUS_EXITING
@@ -80,10 +76,18 @@ class Truck:
                 if abs(dx) > 0.01 or abs(dy) > 0.01:
                     self.heading = np.arctan2(dy, dx)
                 self.pos[0], self.pos[1] = tx, ty
-                if not self.path:
+                
+            # If path is now empty, verify we actually arrived
+            if not self.path:
+                tr, tc = grid.world_to_cell(*self.pos)
+                if self.dump_target and (tr, tc) == self.dump_target:
                     self.status = self.STATUS_REVERSING
-            else:
-                self.status = self.STATUS_REVERSING
+                else:
+                    # GHOST DIRT FIX: We didn't reach the target. Abort dump.
+                    if self.dump_target:
+                        grid.unreserve(*self.dump_target)
+                        self.dump_target = None
+                    self.status = self.STATUS_IDLE
 
         elif self.status == self.STATUS_REVERSING:
             self.status      = self.STATUS_DUMPING
@@ -96,12 +100,9 @@ class Truck:
                     r, c = self.dump_target
                     grid.dump_at(r, c, self.pile_height_per_dump)
                     self.dump_target = None
-                # FIX: don't teleport — go to EXITING and wait for exit path
-                # main.py will call set_exit_path() on this truck
                 self.status = self.STATUS_EXITING
 
         elif self.status == self.STATUS_EXITING:
-            # FIX: navigate back to entry along exit path
             if self._exit_path:
                 r, c = self._exit_path.pop(0)
                 tx, ty = grid.cell_to_world(r, c)
@@ -109,16 +110,14 @@ class Truck:
                 if abs(dx) > 0.01 or abs(dy) > 0.01:
                     self.heading = np.arctan2(dy, dx)
                 self.pos[0], self.pos[1] = tx, ty
+                
                 if not self._exit_path:
                     self.status = self.STATUS_IDLE
             else:
-                # No exit path set yet (waiting for main.py to set it)
-                # or path was empty — go idle at current position
                 self.pos    = list(ENTRY_POINT)
                 self.status = self.STATUS_IDLE
 
     def needs_exit_path(self):
-        """True when truck has just finished dumping and needs an exit path."""
         return (self.status == self.STATUS_EXITING
                 and not self._exit_path
                 and self.dump_target is None)
