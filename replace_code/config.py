@@ -61,6 +61,11 @@ ANGLE_OF_REPOSE    = 35.0
 DRIVE_CLEARANCE_M  = 0.4
 _TAN_REPOSE = math.tan(math.radians(ANGLE_OF_REPOSE))
 
+# ── Hybrid Accessibility Toggle ────────────────────────────
+# When fill_pct < this threshold, we score first, then BFS the top N.
+# When fill_pct >= this threshold, we BFS everything first, then score.
+CONFIG_MATERIAL_HEIGHT_THRESHOLD = 0.70
+
 # ── Scoring filter sizes ───────────────────────────────────
 SCORE_FILTER_SIZE    = int(round(24.0 / CELL_SIZE))
 ENTRY_CORRIDOR_CELLS = max(1, int(round(3.0 / CELL_SIZE)))

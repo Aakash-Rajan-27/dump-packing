@@ -13,7 +13,10 @@
 # This keeps the scoring heuristics physically meaningful
 # at the finer cell resolution.
 #
-# All other scoring logic unchanged.
+# ── MCTS Update ──────────────────────────────────────────────
+# Added `state_override` parameter. This allows MCTS to pass in
+# hypothetical future grids so the heuristics calculate based
+# on future states, rather than getting stuck in the present.
 # ─────────────────────────────────────────────────────────────
 
 import numpy as np
@@ -23,7 +26,7 @@ from config import (WEIGHTS_EARLY, WEIGHTS_MID, WEIGHTS_LATE,
 from grid_map import CellState
 
 
-def score_candidates(grid, candidate_idxs):
+def score_candidates(grid, candidate_idxs, state_override=None):
     """
     Score candidate cells. Higher = better dump location.
     candidate_idxs: list of (row, col) — the subsampled candidates from get_candidates()
@@ -32,8 +35,10 @@ def score_candidates(grid, candidate_idxs):
     if not candidate_idxs:
         return np.array([])
 
-    filled_mask  = (grid.state == CellState.FILLED)
-    partial_mask = (grid.state == CellState.PARTIAL)
+    current_state = state_override if state_override is not None else grid.state
+
+    filled_mask  = (current_state == CellState.FILLED)
+    partial_mask = (current_state == CellState.PARTIAL)
 
     # Score 1: Density — dump near existing material
     has_material  = filled_mask | partial_mask
@@ -49,7 +54,7 @@ def score_candidates(grid, candidate_idxs):
     coverage_score = 1.0 - zone_fill
 
     # Score 3: Height gap — prioritise cells furthest from TARGET_PILE_HEIGHT
-    height_gap     = np.maximum(0.0, TARGET_PILE_HEIGHT - grid.z_height)
+    height_gap      = np.maximum(0.0, TARGET_PILE_HEIGHT - grid.z_height)
     heightgap_score = height_gap / TARGET_PILE_HEIGHT
 
     # Score 4: Pheromone — avoid recently dumped areas

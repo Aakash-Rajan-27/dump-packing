@@ -24,6 +24,19 @@
 #    shapely.contains_xy is batched. ~64ms estimated.
 #
 # 4. All other functions unchanged.
+#
+# ── Phase A & B Updates (Truck-Specific BFS) ───────────────
+# 
+# 5. make_driveable_mask() now strict about PADDOCK RULES: 
+#    A truck cannot drive over non-zero z_height (freshly dumped material).
+#
+# 6. is_accessible() is now completely truck-dimension aware.
+#    It uses `precompute_coarse_blocked_mask` which calculates the specific
+#    physical footprint of the truck (Small/Medium/Large) before allowing
+#    BFS through gaps.
+#
+# 7. is_accessible() now accepts a `precomputed_coarse_mask` to allow 
+#    the Orchestrator to run BFS 50x instantaneously during Phase 1.
 # ─────────────────────────────────────────────────────────────
 
 import numpy as np
@@ -118,11 +131,6 @@ def make_driveable_mask(grid, truck):
       1. State is passable (EMPTY, RESERVED, PROTECTED) AND z_height == 0
       2. The truck rectangle at that heading does not clip any
          PARTIAL/FILLED/BOUNDARY neighbour cell.
-
-    Note: we do NOT require truck corners to be inside the polygon for
-    driving — only for dumping. Trucks drive through the entry corridor
-    (PROTECTED) which sits at the polygon edge; their body extends
-    slightly outside the polygon while passing through, which is fine.
     """
     half_w  = truck.width  / 2.0
     half_l  = truck.length / 2.0
@@ -131,8 +139,6 @@ def make_driveable_mask(grid, truck):
     rows, cols = grid.rows, grid.cols
     mask = np.zeros((rows, cols, 8), dtype=bool)
 
-    # Base passability: driveable states with no material
-    # PROTECTED is explicitly included — it's the entry corridor
     base_ok = np.zeros((rows, cols), dtype=bool)
     for r in range(rows):
         for c in range(cols):
@@ -140,7 +146,8 @@ def make_driveable_mask(grid, truck):
             if s in (CellState.BOUNDARY, CellState.FILLED,
                      CellState.PARTIAL, CellState.OBSTACLE):
                 continue
-            # EMPTY, RESERVED, PROTECTED all pass state check
+            
+            # PADDOCK RULE: Cannot drive over non-leveled material
             if grid.z_height[r, c] > 0:
                 continue
             base_ok[r, c] = True
@@ -149,8 +156,7 @@ def make_driveable_mask(grid, truck):
     if not candidate_cells:
         return mask
 
-    centres = np.array([grid.cell_to_world(r, c)
-                        for r, c in candidate_cells])
+    centres = np.array([grid.cell_to_world(r, c) for r, c in candidate_cells])
     N = len(centres)
 
     for hi in range(8):
@@ -160,21 +166,11 @@ def make_driveable_mask(grid, truck):
             corner_x = centres[:, 0] + dx
             corner_y = centres[:, 1] + dy
 
-            # Check corner cell is not a blocked cell (PARTIAL/FILLED/BOUNDARY)
-            # Do NOT check polygon containment — trucks can slightly overhang
-            # the polygon edge while navigating (esp. at entry corridor)
-            c_col = np.clip(
-                ((corner_x - grid.origin[0]) / grid.cell_size).astype(int),
-                0, cols - 1
-            )
-            c_row = np.clip(
-                ((corner_y - grid.origin[1]) / grid.cell_size).astype(int),
-                0, rows - 1
-            )
+            c_col = np.clip(((corner_x - grid.origin[0]) / grid.cell_size).astype(int), 0, cols - 1)
+            c_row = np.clip(((corner_y - grid.origin[1]) / grid.cell_size).astype(int), 0, rows - 1)
+            
             corner_state = grid.state[c_row, c_col]
-            not_blocked  = ~np.isin(corner_state,
-                                    [CellState.BOUNDARY, CellState.FILLED,
-                                     CellState.PARTIAL, CellState.OBSTACLE])
+            not_blocked  = ~np.isin(corner_state, [CellState.BOUNDARY, CellState.FILLED, CellState.PARTIAL, CellState.OBSTACLE])
             heading_fits &= not_blocked
 
         for i, (r, c) in enumerate(candidate_cells):
@@ -186,35 +182,30 @@ def make_driveable_mask(grid, truck):
 
 # ── Accessibility (isolation check) ───────────────────────
 
-def _build_coarse_blocked(grid):
+def precompute_coarse_blocked_mask(grid, truck):
     """
-    Downsample the fine grid to a coarse grid for BFS.
-    Each coarse cell covers _COARSE_FACTOR x _COARSE_FACTOR fine cells.
-    A coarse cell is blocked if ANY fine cell in its block is FILLED or BOUNDARY.
-
-    Returns: 2D bool array, True = blocked in coarse grid.
+    Downsamples the truck's physical driveability to a coarse grid.
+    This guarantees BFS accounts for the truck's width and length.
     """
     f = _COARSE_FACTOR
-    # Coarse grid dimensions
     cr = (grid.rows + f - 1) // f
     cc = (grid.cols + f - 1) // f
 
-    # Pad fine state array to be divisible by f
+    # 1. Driveability takes truck dimensions into account
+    drive_mask_3d = make_driveable_mask(grid, truck)
+
+    # 2. Cell is passable if truck center can exist here in ANY heading
+    passable_fine = drive_mask_3d.any(axis=2)
+
+    # 3. Pad array to match coarse dimensions. Padding is False (not passable)
     pad_r = cr * f - grid.rows
     pad_c = cc * f - grid.cols
-    padded = np.pad(
-        grid.state,
-        ((0, pad_r), (0, pad_c)),
-        constant_values=CellState.BOUNDARY
-    )
+    padded_passable = np.pad(passable_fine, ((0, pad_r), (0, pad_c)), constant_values=False)
 
-    # Reshape into blocks and check if any cell in block is blocked
-    blocked_fine = np.isin(padded,
-                           [CellState.BOUNDARY, CellState.FILLED,
-                            CellState.PARTIAL, CellState.OBSTACLE])
-    # Shape: (cr, f, cc, f) → max over block dims
-    coarse_blocked = blocked_fine.reshape(cr, f, cc, f).any(axis=(1, 3))
-    return coarse_blocked
+    # 4. A coarse block is PASSABLE if the truck center can exist in AT LEAST ONE of its fine cells.
+    coarse_passable = padded_passable.reshape(cr, f, cc, f).any(axis=(1, 3))
+
+    return ~coarse_passable
 
 
 def _has_bridge_risk(grid, r, c):
@@ -226,102 +217,82 @@ def _has_bridge_risk(grid, r, c):
     return sum([n, s, w, e]) >= 2
 
 
-def is_accessible(grid, r, c, entry_rc):
+def is_accessible(grid, r, c, entry_rc, truck, precomputed_coarse_mask=None):
     """
     CHANGED: BFS on coarse downsampled grid instead of full fine grid.
-    Old: BFS on 31x31 = fast. New fine grid: 181x181 = 100ms per call.
-    Fix: downsample 6x to ~31x31 coarse grid, run BFS there instead.
-
-    The isolation property is topological — a region cut off at 3m
-    resolution is still cut off at 0.5m resolution. No accuracy lost.
+    Accepts a precomputed mask for high-speed batch checking.
     """
     if not _has_bridge_risk(grid, r, c):
         return True
 
     f = _COARSE_FACTOR
-    coarse_blocked = _build_coarse_blocked(grid)
+    
+    # Use provided mask (fast) or compute it on the fly (slower if called in a loop)
+    coarse_blocked = precomputed_coarse_mask if precomputed_coarse_mask is not None else precompute_coarse_blocked_mask(grid, truck)
 
     cr = coarse_blocked.shape[0]
     cc = coarse_blocked.shape[1]
 
-    # Map fine cell (r,c) to coarse cell
     coarse_r = r // f
     coarse_c = c // f
+    
+    # We must copy the mask if we are modifying it so we don't ruin the precomputed original
+    temp_blocked = coarse_blocked.copy()
+    temp_blocked[coarse_r, coarse_c] = True
 
-    # Hypothetically block the coarse cell containing (r,c)
-    coarse_blocked[coarse_r, coarse_c] = True
-
-    # Map entry_rc to coarse
     entry_coarse = (entry_rc[0] // f, entry_rc[1] // f)
 
-    # BFS on coarse grid
     visited = set()
     queue   = deque([entry_coarse])
 
     while queue:
         er2, ec2 = queue.popleft()
-        if (er2, ec2) in visited:
-            continue
+        if (er2, ec2) in visited: continue
         visited.add((er2, ec2))
+        
         for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
             nr2, nc2 = er2+dr, ec2+dc
-            if not (0 <= nr2 < cr and 0 <= nc2 < cc):
-                continue
-            if coarse_blocked[nr2, nc2]:
-                continue
+            if not (0 <= nr2 < cr and 0 <= nc2 < cc): continue
+            if temp_blocked[nr2, nc2]: continue
             if (nr2, nc2) not in visited:
                 queue.append((nr2, nc2))
 
-    # All non-blocked coarse cells that should be reachable
-    all_reachable = set(zip(*np.where(~coarse_blocked)))
+    all_reachable = set(zip(*np.where(~temp_blocked)))
     return len(all_reachable - visited) == 0
 
 
 # ── Main Entry Point ───────────────────────────────────────
 
-def get_candidates(grid, truck, entry_rc):
+def get_raw_candidates(grid, truck):
     """
-    CHANGED: subsampled candidate selection.
-    Old: every dumpable cell = candidate (961 at 3m cells — manageable)
-    New: at 0.5m there are 28k+ dumpable cells — too many for MCTS/scoring.
-         Subsample: one candidate per _CANDIDATE_STRIDE × _CANDIDATE_STRIDE
-         block (= one per 3m × 3m physical area = same count as before).
-         Within each block, pick the cell with lowest z_height (best to dump).
-
-    This preserves the full fine-resolution height map for physics accuracy
-    while keeping the planning problem tractable.
+    Just grabs the subsampled cells and ensures the dump cone fits.
+    Does NOT do BFS. The Orchestrator will handle BFS based on fill_pct.
     """
     stride = _CANDIDATE_STRIDE
 
-    # Build dumpable mask
     dumpable = np.zeros((grid.rows, grid.cols), dtype=bool)
     for r in range(grid.rows):
         for c in range(grid.cols):
             dumpable[r, c] = grid.is_dumpable(r, c)
 
     candidates = []
-    # Walk in stride steps
     for r0 in range(0, grid.rows, stride):
         for c0 in range(0, grid.cols, stride):
             r1 = min(r0 + stride, grid.rows)
             c1 = min(c0 + stride, grid.cols)
 
-            # Find dumpable cells in this block
             block_dumpable = dumpable[r0:r1, c0:c1]
             if not block_dumpable.any():
                 continue
 
-            # Pick cell with lowest z_height in block (most room for more material)
             block_z = grid.z_height[r0:r1, c0:c1].copy()
             block_z[~block_dumpable] = np.inf
-            local_idx = np.unravel_index(block_z.argmin(),
-                                         block_z.shape)
+            local_idx = np.unravel_index(block_z.argmin(), block_z.shape)
             r, c = r0 + local_idx[0], c0 + local_idx[1]
             candidates.append((r, c))
 
     if not candidates:
         return []
 
-    # Dump accessibility filter
     fits = dump_accessibility_ok(grid, candidates, truck)
     return [cell for cell, ok in zip(candidates, fits) if ok]
