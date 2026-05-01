@@ -3,12 +3,10 @@
 # THE SIMULATION LOOP — mixed fleet edition.
 #
 # FIX: Hybrid Orchestrator implemented.
-#      - Early Phase (fill < threshold): Scores all raw candidates first, 
-#        then BFS filters only the top 50 for max speed.
-#      - Late Phase (fill >= threshold): BFS filters the whole site first, 
-#        then scores guaranteed-accessible cells.
-# FIX: Exit paths are now automatically planned for trucks that 
-#      finish dumping using `needs_exit_path()`.
+# FIX: Exit paths are automatically planned for trucks.
+# FIX: Removed the `continue` trap so active trucks never freeze.
+# FIX: Added `STEPS_PER_TICK` loop so trucks don't crawl.
+# FIX: Corrected Pheromone Math to fix the "blue smudge" bug.
 # ─────────────────────────────────────────────────────────────
 
 import sys
@@ -21,7 +19,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 from config import (POLYGON_BOUNDARY, ENTRY_POINT, CELL_SIZE,
                     FLEET_COMPOSITION, TICK_DELAY, PYGAME_SCALE,
                     PHEROMONE_DECAY, PHEROMONE_SPREAD_SIGMA,
-                    CONFIG_MATERIAL_HEIGHT_THRESHOLD)
+                    CONFIG_MATERIAL_HEIGHT_THRESHOLD, STEPS_PER_TICK)
 import grid_map
 from truck      import Truck
 from filters    import get_raw_candidates, is_accessible, precompute_coarse_blocked_mask
@@ -61,7 +59,6 @@ def run_simulation():
 
     tick       = 0
     done       = False
-    candidates = []
 
     while not done:
         if renderer.check_quit():
@@ -77,10 +74,9 @@ def run_simulation():
 
         idle_trucks = [t for t in trucks if t.is_idle()]
 
+        # ── PLANNING PHASE ─────────────────────────────────────────
         if idle_trucks:
             repr_truck = max(idle_trucks, key=lambda t: t.width * t.length)
-            
-            # Step 2: Grab the raw 3m x 3m subsampled grid points
             raw_candidates = get_raw_candidates(grid, repr_truck)
 
             if not raw_candidates:
@@ -90,14 +86,11 @@ def run_simulation():
 
             fp = grid.fill_pct()
             top_candidates = []
-            
-            # ── PHASE B: THE HYBRID ORCHESTRATOR ───────────────────────
             coarse_mask = precompute_coarse_blocked_mask(grid, repr_truck)
 
             if fp < CONFIG_MATERIAL_HEIGHT_THRESHOLD:
-                # Early Phase: Score first, then BFS only the best
                 scores = score_candidates(grid, raw_candidates)
-                top_indices = scores.argsort()[::-1] # Sort descending
+                top_indices = scores.argsort()[::-1]
                 
                 for idx in top_indices:
                     r, c = raw_candidates[idx]
@@ -106,7 +99,6 @@ def run_simulation():
                     if len(top_candidates) >= 50:
                         break
             else:
-                # Late Phase: BFS first, then score
                 accessible_cands = [
                     (r, c) for r, c in raw_candidates
                     if is_accessible(grid, r, c, entry_rc, repr_truck, precomputed_coarse_mask=coarse_mask)
@@ -115,54 +107,47 @@ def run_simulation():
                     scores = score_candidates(grid, accessible_cands)
                     top_indices = scores.argsort()[-50:][::-1]
                     top_candidates = [accessible_cands[i] for i in top_indices]
-            # ───────────────────────────────────────────────────────────
 
-            if not top_candidates:
-                time.sleep(0.1)
-                continue
+            # FIX: Replaced `continue` with nested execution so active trucks don't freeze
+            if top_candidates:
+                assignments_all = []
+                claimed_points  = set()
+                remaining_idle  = list(idle_trucks)
 
-            # Step 4: Run Deep Tree MCTS per truck class
-            assignments_all = []
-            claimed_points  = set()
-            remaining_idle  = list(idle_trucks)
+                for cls in ('large', 'medium', 'small'):
+                    cls_trucks = [t for t in remaining_idle if t.truck_class == cls]
+                    if not cls_trucks:
+                        continue
 
-            for cls in ('large', 'medium', 'small'):
-                cls_trucks = [t for t in remaining_idle if t.truck_class == cls]
-                if not cls_trucks:
-                    continue
+                    avail = [(r, c) for r, c in top_candidates if (r, c) not in claimed_points]
+                    if not avail:
+                        break
 
-                avail = [(r, c) for r, c in top_candidates if (r, c) not in claimed_points]
-                if not avail:
-                    break
+                    n_needed = len(cls_trucks)
+                    dump_points = mcts_select_dump_points(grid, avail, cls_trucks[0], n_trucks=n_needed, n_sim=200)
 
-                n_needed = len(cls_trucks)
-                # Pass entry_rc and repr_truck to MCTS so it can run its own heuristics
-                dump_points = mcts_select_dump_points(grid, avail, cls_trucks[0], n_trucks=n_needed, n_sim=200)
+                    if not dump_points:
+                        continue
 
-                if not dump_points:
-                    continue
+                    these_assignments = assign(cls_trucks[:len(dump_points)], dump_points, grid)
+                    assignments_all.extend(these_assignments)
+                    for _, dp in these_assignments: claimed_points.add(dp)
+                    for t, _ in these_assignments:  remaining_idle.remove(t)
 
-                these_assignments = assign(cls_trucks[:len(dump_points)], dump_points, grid)
-                assignments_all.extend(these_assignments)
-                for _, dp in these_assignments: claimed_points.add(dp)
-                for t, _ in these_assignments:  remaining_idle.remove(t)
+                if assignments_all:
+                    paths = plan_paths(grid, assignments_all)
+                    for truck, dump_point in assignments_all:
+                        truck_path = paths.get(truck.id, [])
+                        truck.set_path(truck_path, dump_point, grid)
 
-            if not assignments_all:
-                time.sleep(0.1)
-                continue
+        # ── MOVEMENT PHASE (Will always run now) ───────────────────
+        for _ in range(STEPS_PER_TICK):
+            for truck in trucks:
+                truck.step(grid)
 
-            # Step 6: Path plan for forward journey
-            paths = plan_paths(grid, assignments_all)
-
-            for truck, dump_point in assignments_all:
-                truck_path = paths.get(truck.id, [])
-                truck.set_path(truck_path, dump_point, grid)
-
-        for truck in trucks:
-            truck.step(grid)
-
-        grid.pheromone *= PHEROMONE_DECAY
-        grid.pheromone  = gaussian_filter(grid.pheromone, sigma=PHEROMONE_SPREAD_SIGMA)
+        # ── PHEROMONE PHASE (Blue Smudge Fix) ──────────────────────
+        grid.pheromone = 1.0 - (1.0 - grid.pheromone) * PHEROMONE_DECAY
+        grid.pheromone = gaussian_filter(grid.pheromone, sigma=PHEROMONE_SPREAD_SIGMA)
         np.clip(grid.pheromone, 0.0, 1.0, out=grid.pheromone)
 
         metrics = {
@@ -170,8 +155,8 @@ def run_simulation():
             'fleet':      f"{FLEET_COMPOSITION['small']}S/{FLEET_COMPOSITION['medium']}M/{FLEET_COMPOSITION['large']}L",
             'idle':       len(idle_trucks),
             'candidates': len(top_candidates) if 'top_candidates' in locals() else '-',
-            'fill%':      f"{grid.fill_pct()*100:.1f}",
-            'pack%':      f"{grid.pack_pct()*100:.1f}",
+            'fill%':      f"{grid.fill_pct()*100:.3f}",
+            'pack%':      f"{grid.pack_pct()*100:.3f}",
         }
         renderer.draw(trucks, metrics)
 
@@ -180,12 +165,12 @@ def run_simulation():
 
     print("\n=== Final Results ===")
     print(f"Total ticks:   {tick}")
-    print(f"Fill %:        {grid.fill_pct()*100:.1f}%")
-    print(f"Pack density:  {grid.pack_pct()*100:.1f}%")
+    print(f"Fill %:        {grid.fill_pct()*100:.3f}%")
+    print(f"Pack density:  {grid.pack_pct()*100:.3f}%")
 
     print("\nClose the window to exit.")
     while not renderer.check_quit():
-        renderer.draw(trucks, {'FINAL': 'done', 'fill%': f"{grid.fill_pct()*100:.1f}", 'pack%': f"{grid.pack_pct()*100:.1f}"})
+        renderer.draw(trucks, {'FINAL': 'done', 'fill%': f"{grid.fill_pct()*100:.3f}", 'pack%': f"{grid.pack_pct()*100:.3f}"})
         time.sleep(0.1)
     renderer.close()
 

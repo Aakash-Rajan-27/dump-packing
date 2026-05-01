@@ -1,8 +1,8 @@
 # mcts.py
 # ─────────────────────────────────────────────────────────────
-# FIX: Merged Deep Tree structure (Tapered Branching 50->6->3->0)
-#      with the base_dumpable loop optimization for extreme speed.
-# FIX: Now utilizes `score_candidates` with `state_override` to 
+# FIX: Merged Deep Tree structure with the base_dumpable loop 
+#      optimization for extreme speed (prevents 4-million loop lag).
+# FIX: Uses `score_candidates` with `state_override` to 
 #      evaluate true future states inside the tree expansion.
 # ─────────────────────────────────────────────────────────────
 
@@ -36,22 +36,24 @@ class MCTSNode:
 
 
 def get_top_m_next_moves(base_state, base_heights, path_so_far, grid, base_dumpable, dump_add, m=6):
-    """Uses scoring heuristics to pick top M branches in the deep tree."""
     hypothetical_state   = base_state.copy()
     hypothetical_heights = base_heights.copy()
     
-    # Apply path so far
+    # Fast copy
+    empty = list(base_dumpable)
+    
     for cell in path_so_far:
         if cell is not None:
             r, c = cell
             hypothetical_heights[r, c] = min(hypothetical_heights[r, c] + dump_add, TARGET_PILE_HEIGHT)
             hypothetical_state[r, c]   = CellState.FILLED if hypothetical_heights[r, c] >= TARGET_PILE_HEIGHT else CellState.PARTIAL
+            
+            if hypothetical_heights[r, c] >= TARGET_PILE_HEIGHT:
+                try: empty.remove(cell)
+                except ValueError: pass
 
-    # Find still empty/valid cells
-    empty = [cell for cell in base_dumpable if hypothetical_heights[cell[0], cell[1]] < TARGET_PILE_HEIGHT]
     if not empty: return []
 
-    # Score using FUTURE goggles (state_override)
     scores = score_candidates(grid, empty, state_override=hypothetical_state)
     scored_empty = list(zip(scores, empty))
     scored_empty.sort(key=lambda x: x[0], reverse=True)
@@ -60,20 +62,20 @@ def get_top_m_next_moves(base_state, base_heights, path_so_far, grid, base_dumpa
 
 
 def rollout_score_path(base_state, base_heights, path, base_dumpable, dump_add, grid, depth=20):
-    """Simulates the specific MCTS path, then random rollouts."""
     heights = base_heights.copy()
     states  = base_state.copy()
 
+    # Fast copy
+    dumpable = list(base_dumpable)
+    
     for cell in path:
         if cell is not None:
             r0, c0 = cell
             heights[r0, c0] = min(heights[r0, c0] + dump_add, TARGET_PILE_HEIGHT)
             states[r0, c0]  = CellState.FILLED if heights[r0, c0] >= TARGET_PILE_HEIGHT else CellState.PARTIAL
-
-    path_cells = set(c for c in path if c is not None)
-    dumpable = [cell for cell in base_dumpable
-                if heights[cell[0], cell[1]] < TARGET_PILE_HEIGHT
-                and cell not in path_cells]
+            
+            try: dumpable.remove(cell)
+            except ValueError: pass
 
     for _ in range(min(depth, len(dumpable))):
         if not dumpable: break
@@ -158,8 +160,11 @@ def mcts_select_dump_points(grid, candidates, truck, n_trucks, n_sim=100):
 
     best_path = []
     curr_node = root
-    for _ in range(min(n_trucks, len(candidates))):
-        if not curr_node.children: break
+    
+    for _ in range(n_trucks):
+        if not curr_node.children:
+            break
+            
         best_child = max(curr_node.children, key=lambda n: n.visits)
         best_path.append(best_child.cell)
         curr_node = best_child

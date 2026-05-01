@@ -1,12 +1,9 @@
 # truck.py
 # ─────────────────────────────────────────────────────────────
-# FIX: STATUS_EXITING now actually navigates back to entry.
-# FIX (CRITICAL PADDOCK BUG): "Ghost Dirt" patch. Trucks previously 
-#      dumped instantly if the pathfinder failed and returned an empty path. 
-#      Now strictly verifies physical arrival at dump_target before reversing.
-#      Before this, if a path wasn't found, an empty path will be retuned which will make the truck 
-#      think it has arrived at the dump point and start dumping, even though it's not there. 
-#    This causes "ghost dirt" to appear on the grid where the truck thinks it dumped but actually didn't.
+# FIX: Added `grid.unreserve()` calls. 
+#      Previously, trucks permanently locked cells in the RESERVED state. 
+#      Because grid_map ignores state updates for RESERVED cells, the 
+#      renderer couldn't "see" the dirt that was being dumped.
 # ─────────────────────────────────────────────────────────────
 
 import numpy as np
@@ -48,8 +45,11 @@ class Truck:
         self.path        = list(path)
         self.dump_target = dump_target
         
-        # If path is empty (pathfinder failed), abort immediately.
+        # If path is empty (pathfinder failed), abort and unreserve immediately.
         if not self.path:
+            if self.dump_target:
+                grid.unreserve(*self.dump_target)
+                self.dump_target = None
             self.status = self.STATUS_IDLE
             return
             
@@ -83,7 +83,6 @@ class Truck:
                 if self.dump_target and (tr, tc) == self.dump_target:
                     self.status = self.STATUS_REVERSING
                 else:
-                    # GHOST DIRT FIX: We didn't reach the target. Abort dump.
                     if self.dump_target:
                         grid.unreserve(*self.dump_target)
                         self.dump_target = None
@@ -99,6 +98,7 @@ class Truck:
                 if self.dump_target:
                     r, c = self.dump_target
                     grid.dump_at(r, c, self.pile_height_per_dump)
+                    grid.unreserve(r, c)  # CRITICAL: Let the grid visually update the cell
                     self.dump_target = None
                 self.status = self.STATUS_EXITING
 

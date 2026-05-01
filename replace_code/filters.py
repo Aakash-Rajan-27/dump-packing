@@ -9,41 +9,30 @@
 #         coarser grid without losing accuracy.
 #         Downsample by factor = int(3.0 / CELL_SIZE) = 6x.
 #         Resulting BFS grid: 31x31, same as before = <1ms.
-#         A cell is 'blocked' in coarse grid if ANY fine cell in that
-#         block is FILLED or BOUNDARY.
 #
-# 2. get_candidates() — subsampled candidate selection
-#    Old: all dumpable cells as candidates (32k at 0.5m — too many)
-#    New: subsample to one candidate per 3m×3m block (original cell size).
-#         This gives ~800 candidates max, same as before. MCTS and
-#         scoring still operate at this granularity. The fine grid is
-#         used for accurate height modelling, not for candidate count.
+# 2. get_raw_candidates() — subsampled candidate selection
+#    Subsamples to one candidate per 3m×3m block to keep the planning 
+#    problem tractable for MCTS while retaining fine-grid physics.
 #
-# 3. make_driveable_mask() — no change in logic, but runs on fine grid
-#    At 0.5m with 28k+ cells × 8 headings this is still fast because
-#    shapely.contains_xy is batched. ~64ms estimated.
-#
-# 4. All other functions unchanged.
-#
-# ── Phase A & B Updates (Truck-Specific BFS) ───────────────
+# ── Phase A & B Updates (Truck-Specific BFS & Gate Fix) ────────
 # 
-# 5. make_driveable_mask() now strict about PADDOCK RULES: 
-#    A truck cannot drive over non-zero z_height (freshly dumped material).
+# 3. PADDOCK RULE: make_driveable_mask() now ensures a truck 
+#    cannot drive over non-zero z_height (freshly dumped material).
 #
-# 6. is_accessible() is now completely truck-dimension aware.
-#    It uses `precompute_coarse_blocked_mask` which calculates the specific
-#    physical footprint of the truck (Small/Medium/Large) before allowing
-#    BFS through gaps.
+# 4. TRUCK-AWARE BFS: is_accessible() uses `precompute_coarse_blocked_mask` 
+#    which calculates the specific physical footprint of the truck 
+#    (Small/Medium/Large) before allowing BFS through gaps.
 #
-# 7. is_accessible() now accepts a `precomputed_coarse_mask` to allow 
-#    the Orchestrator to run BFS 50x instantaneously during Phase 1.
+# 5. GATE COLLISION FIX: make_driveable_mask now permits BOUNDARY 
+#    clipping if the truck is within 15m of the ENTRY_POINT. 
+#    This prevents Large/Medium trucks from failing A* instantly at spawn.
 # ─────────────────────────────────────────────────────────────
 
 import numpy as np
 from collections import deque
 import shapely
 from grid_map import CellState
-from config import CELL_SIZE
+from config import CELL_SIZE, ENTRY_POINT
 
 _BLOCKED = (CellState.BOUNDARY, CellState.FILLED,
             CellState.PARTIAL, CellState.OBSTACLE)
@@ -158,6 +147,7 @@ def make_driveable_mask(grid, truck):
 
     centres = np.array([grid.cell_to_world(r, c) for r, c in candidate_cells])
     N = len(centres)
+    ex, ey = ENTRY_POINT
 
     for hi in range(8):
         heading_fits = np.ones(N, dtype=bool)
@@ -170,8 +160,14 @@ def make_driveable_mask(grid, truck):
             c_row = np.clip(((corner_y - grid.origin[1]) / grid.cell_size).astype(int), 0, rows - 1)
             
             corner_state = grid.state[c_row, c_col]
-            not_blocked  = ~np.isin(corner_state, [CellState.BOUNDARY, CellState.FILLED, CellState.PARTIAL, CellState.OBSTACLE])
-            heading_fits &= not_blocked
+            dist_to_entry = np.hypot(corner_x - ex, corner_y - ey)
+            
+            # FAT TRUCK GATE FIX: 
+            # Allow Boundary clipping only if we are right next to the spawn gate
+            is_blocked  = np.isin(corner_state, [CellState.FILLED, CellState.PARTIAL, CellState.OBSTACLE])
+            is_boundary = (corner_state == CellState.BOUNDARY) & (dist_to_entry > 15.0)
+            
+            heading_fits &= ~(is_blocked | is_boundary)
 
         for i, (r, c) in enumerate(candidate_cells):
             if heading_fits[i]:
@@ -209,7 +205,7 @@ def precompute_coarse_blocked_mask(grid, truck):
 
 
 def _has_bridge_risk(grid, r, c):
-    """O(1) bridge risk check — unchanged."""
+    """O(1) bridge risk check."""
     n = r - 1 < 0          or grid.state[r-1, c] in _BRIDGE_RISK_BLOCKED
     s = r + 1 >= grid.rows or grid.state[r+1, c] in _BRIDGE_RISK_BLOCKED
     w = c - 1 < 0          or grid.state[r, c-1] in _BRIDGE_RISK_BLOCKED
@@ -219,7 +215,7 @@ def _has_bridge_risk(grid, r, c):
 
 def is_accessible(grid, r, c, entry_rc, truck, precomputed_coarse_mask=None):
     """
-    CHANGED: BFS on coarse downsampled grid instead of full fine grid.
+    BFS on coarse downsampled grid instead of full fine grid.
     Accepts a precomputed mask for high-speed batch checking.
     """
     if not _has_bridge_risk(grid, r, c):
