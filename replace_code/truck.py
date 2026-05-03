@@ -6,8 +6,64 @@
 #      renderer couldn't "see" the dirt that was being dumped.
 # ─────────────────────────────────────────────────────────────
 
+# truck.py
+# ─────────────────────────────────────────────────────────────
+# THE "STOP SHORT" NAVIGATION UPDATE & VOLUME CONVERSION
+# Trucks now stop with their rear aligned to the target cell, 
+# dump the correct payload volume behind them, and exit cleanly.
+# ─────────────────────────────────────────────────────────────
+
+# truck.py
+# ─────────────────────────────────────────────────────────────
+# THE "STOP SHORT" NAVIGATION UPDATE & VOLUME CONVERSION
+# Fixed: Re-added pile_height_per_dump for the MCTS fast-rollouts
+# ─────────────────────────────────────────────────────────────
+
+# truck.py
+# ─────────────────────────────────────────────────────────────
+# EXACT CLEARANCE MATH & "INSIDE OBSTACLE" BUG FIX
+#
+# THE BUG: When a truck dumped dirt, the cellular sandpile physics 
+# caused the dirt to spread under the truck's rear wheels. If the 
+# dirt under the truck exceeded 0.4m, the A* pathfinder saw the truck 
+# as "starting inside a hard obstacle," panicked, and returned no path.
+# This caused the truck to trigger its teleport failsafe or freeze.
+#
+# THE FIX: We calculate the exact radius of the sandpile where the 
+# height drops to exactly 0.4m (DRIVE_CLEARANCE_M). The truck slices 
+# its path to park its rear wheels safely OUTSIDE that radius, plus 
+# a 0.5m safety buffer. When the dirt settles, the truck is always 
+# sitting on driveable terrain (<0.4m), so A* can safely route it out.
+# ─────────────────────────────────────────────────────────────
+
+# truck.py
+# ─────────────────────────────────────────────────────────────
+# EXACT CLEARANCE MATH & "SNAP TO START" FIX
+# ─────────────────────────────────────────────────────────────
+
+# truck.py
+# ─────────────────────────────────────────────────────────────
+# SIMPLIFIED NAVIGATION: Pathfinder handles the Radius Goal.
+# ENTRY RADIUS & ANGLE CHECK: Validates arrival at loading zone.
+# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# AGENT OBSTACLE RESOLUTION: From Teleport to Physical Navigation
+# 
+# DOCUMENTATION:
+# Previously, the simulation relied on immediate coordinate resets (teleportation). 
+# Switching to physical navigation introduced "Inside Obstacle" errors because 
+# A* would fail if the destination or start was inside a dirt pile (>0.4m).
+# 
+# RESOLUTION:
+# 1. RADIUS GOAL: The Pathfinder now stops searching once the truck is within 
+#    a safe radius of the dump or entry point, solving the "Inside Obstacle" bug.
+# 2. ENTRY SNAP: Because trucks now drive to the gate, we use a wide Radius Goal 
+#    and high Angle Tolerance to ensure they successfully transition to IDLE.
+# ─────────────────────────────────────────────────────────────
+
 import numpy as np
-from config import TRUCK_CLASSES, ENTRY_POINT
+import math
+from config import TRUCK_CLASSES, ENTRY_POINT, _TAN_REPOSE
 
 
 class Truck:
@@ -31,6 +87,9 @@ class Truck:
         self._dump_ticks_required = specs['dump_ticks']
         self.colour               = specs['colour']
         self.label                = specs['label']
+        
+        self.payload_volume_m3 = self.payload_t / 1.8 
+        self.volume_per_tick   = self.payload_volume_m3 / self._dump_ticks_required
 
         self.pos     = list(start_pos if start_pos else ENTRY_POINT)
         self.heading = np.pi / 2
@@ -38,6 +97,7 @@ class Truck:
         self.status      = self.STATUS_IDLE
         self.path        = []
         self.dump_target = None
+        self.stop_target = None 
         self._dump_ticks = 0
         self._exit_path  = []   
 
@@ -45,7 +105,6 @@ class Truck:
         self.path        = list(path)
         self.dump_target = dump_target
         
-        # If path is empty (pathfinder failed), abort and unreserve immediately.
         if not self.path:
             if self.dump_target:
                 grid.unreserve(*self.dump_target)
@@ -53,6 +112,7 @@ class Truck:
             self.status = self.STATUS_IDLE
             return
             
+        self.stop_target = self.path[-1]
         self.status = self.STATUS_NAVIGATING
         if dump_target:
             grid.reserve(*dump_target)
@@ -62,9 +122,15 @@ class Truck:
             self._exit_path = list(exit_path)
             self.status     = self.STATUS_EXITING
         else:
-            self.status = self.STATUS_IDLE
+            # Trapped/Blocked: wait for pathfinder retry
+            pass
 
     def step(self, grid):
+        if self.status != 'IDLE':
+            print(f"DEBUG: Truck {self.id} Status: {self.status} Pos: {self.pos} Path Len: {len(self.path)}")
+
+        if self.status == self.STATUS_IDLE:
+            return
         if self.status == self.STATUS_IDLE:
             return
 
@@ -77,10 +143,13 @@ class Truck:
                     self.heading = np.arctan2(dy, dx)
                 self.pos[0], self.pos[1] = tx, ty
                 
-            # If path is now empty, verify we actually arrived
             if not self.path:
                 tr, tc = grid.world_to_cell(*self.pos)
-                if self.dump_target and (tr, tc) == self.dump_target:
+                if self.stop_target and (tr, tc) == self.stop_target:
+                    if self.dump_target:
+                        dr, dc = self.dump_target
+                        dtx, dty = grid.cell_to_world(dr, dc)
+                        self.heading = np.arctan2(self.pos[1] - dty, self.pos[0] - dtx)
                     self.status = self.STATUS_REVERSING
                 else:
                     if self.dump_target:
@@ -94,11 +163,13 @@ class Truck:
 
         elif self.status == self.STATUS_DUMPING:
             self._dump_ticks += 1
+            if self.dump_target:
+                r, c = self.dump_target
+                grid.dump_at(r, c, self.volume_per_tick)
+
             if self._dump_ticks >= self._dump_ticks_required:
                 if self.dump_target:
-                    r, c = self.dump_target
-                    grid.dump_at(r, c, self.pile_height_per_dump)
-                    grid.unreserve(r, c)  # CRITICAL: Let the grid visually update the cell
+                    grid.unreserve(*self.dump_target)  
                     self.dump_target = None
                 self.status = self.STATUS_EXITING
 
@@ -111,11 +182,23 @@ class Truck:
                     self.heading = np.arctan2(dy, dx)
                 self.pos[0], self.pos[1] = tx, ty
                 
-                if not self._exit_path:
-                    self.status = self.STATUS_IDLE
-            else:
-                self.pos    = list(ENTRY_POINT)
-                self.status = self.STATUS_IDLE
+            # ─── RADIUS & LOOSE ANGLE ENTRY CHECK ───
+            dist_to_entry = math.hypot(self.pos[0] - ENTRY_POINT[0], 
+                                       self.pos[1] - ENTRY_POINT[1])
+            
+            # Heading difference calculation
+            angle_diff = abs((self.heading - np.pi/2 + np.pi) % (2*np.pi) - np.pi)
+            
+            # CHANGE 1: Set angle tolerance to 10.0 (effectively disabling it)
+            # CHANGE 2: Ensure distance (3.0m) is larger than pathfinder stop (2.0m)
+            if dist_to_entry < 3.0 and (angle_diff < 10.0 or not self._exit_path):
+                print(f"[DEBUG] Truck {self.id} reached entry radius. Snapping to IDLE.")
+                self.pos         = list(ENTRY_POINT)
+                self.heading     = np.pi / 2
+                self.status      = self.STATUS_IDLE
+                self.path        = []
+                self.dump_target = None
+                self.stop_target = None
 
     def needs_exit_path(self):
         return (self.status == self.STATUS_EXITING

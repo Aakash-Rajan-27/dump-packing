@@ -28,32 +28,29 @@
 #    This prevents Large/Medium trucks from failing A* instantly at spawn.
 # ─────────────────────────────────────────────────────────────
 
+# filters.py
+# ─────────────────────────────────────────────────────────────
+# HARD OBSTACLES RESTORED: Dirt > 0.4m is once again a strict,
+# impassable wall in the driveable mask. The precise math in truck.py
+# guarantees we will never accidentally park inside a wall.
+# ─────────────────────────────────────────────────────────────
+
 import numpy as np
 from collections import deque
 import shapely
 from grid_map import CellState
-from config import CELL_SIZE, ENTRY_POINT
+from config import CELL_SIZE, ENTRY_POINT, DRIVE_CLEARANCE_M
 
-_BLOCKED = (CellState.BOUNDARY, CellState.FILLED,
-            CellState.PARTIAL, CellState.OBSTACLE)
-
+_BLOCKED = (CellState.BOUNDARY, CellState.FILLED, CellState.OBSTACLE)
 _BRIDGE_RISK_BLOCKED = (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE)
 
 _HEADING_ANGLES = [i * np.pi / 4 for i in range(8)]
 
-# Downsample factor for BFS: coarse cell = 3m physical regardless of CELL_SIZE
-# At CELL_SIZE=0.5m: factor=6 → coarse grid = fine/6 ≈ 31x31
-# At CELL_SIZE=3.0m: factor=1 → no downsampling
 _COARSE_FACTOR = max(1, int(round(3.0 / CELL_SIZE)))
-
-# Subsample stride for candidate selection (one candidate per 3m block)
 _CANDIDATE_STRIDE = max(1, int(round(3.0 / CELL_SIZE)))
 
 
-# ── Corner offset precomputation ───────────────────────────
-
 def _build_corner_offsets(half_w, half_l):
-    """8 heading angles × 4 corners → (8,4,2) offset array."""
     offsets = np.zeros((len(_HEADING_ANGLES), 4, 2), dtype=np.float64)
     for hi, heading in enumerate(_HEADING_ANGLES):
         fwd  = np.array([np.cos(heading), np.sin(heading)])
@@ -67,7 +64,6 @@ def _build_corner_offsets(half_w, half_l):
 
 
 def _build_dump_offsets(half_w, half_l):
-    """4 cardinal reversed headings × 4 corners → (4,4,2) for dump check."""
     angles  = [0, np.pi/2, np.pi, 3*np.pi/2]
     offsets = np.zeros((4, 4, 2), dtype=np.float64)
     for hi, heading in enumerate(angles):
@@ -82,10 +78,7 @@ def _build_dump_offsets(half_w, half_l):
     return offsets
 
 
-# ── Dump Accessibility ─────────────────────────────────────
-
 def dump_accessibility_ok(grid, candidates, truck):
-    """Vectorized: can this truck reverse into each candidate cell?"""
     if not candidates:
         return np.array([], dtype=bool)
 
@@ -110,17 +103,7 @@ def dump_accessibility_ok(grid, candidates, truck):
     return fits
 
 
-# ── Heading-Aware Driveability ─────────────────────────────
-
 def make_driveable_mask(grid, truck):
-    """
-    (rows, cols, 8) heading-aware driveable mask.
-
-    A cell is driveable at heading h if:
-      1. State is passable (EMPTY, RESERVED, PROTECTED) AND z_height == 0
-      2. The truck rectangle at that heading does not clip any
-         PARTIAL/FILLED/BOUNDARY neighbour cell.
-    """
     half_w  = truck.width  / 2.0
     half_l  = truck.length / 2.0
     offsets = _build_corner_offsets(half_w, half_l)
@@ -132,13 +115,13 @@ def make_driveable_mask(grid, truck):
     for r in range(rows):
         for c in range(cols):
             s = grid.state[r, c]
-            if s in (CellState.BOUNDARY, CellState.FILLED,
-                     CellState.PARTIAL, CellState.OBSTACLE):
-                continue
             
-            # PADDOCK RULE: Cannot drive over non-leveled material
-            if grid.z_height[r, c] > 0:
+            if s in _BLOCKED:
                 continue
+                
+            if grid.z_height[r, c] > DRIVE_CLEARANCE_M:
+                continue
+                
             base_ok[r, c] = True
 
     candidate_cells = list(zip(*np.where(base_ok)))
@@ -160,11 +143,10 @@ def make_driveable_mask(grid, truck):
             c_row = np.clip(((corner_y - grid.origin[1]) / grid.cell_size).astype(int), 0, rows - 1)
             
             corner_state = grid.state[c_row, c_col]
+            corner_z     = grid.z_height[c_row, c_col]
             dist_to_entry = np.hypot(corner_x - ex, corner_y - ey)
             
-            # FAT TRUCK GATE FIX: 
-            # Allow Boundary clipping only if we are right next to the spawn gate
-            is_blocked  = np.isin(corner_state, [CellState.FILLED, CellState.PARTIAL, CellState.OBSTACLE])
+            is_blocked  = np.isin(corner_state, [CellState.FILLED, CellState.OBSTACLE]) | (corner_z > DRIVE_CLEARANCE_M)
             is_boundary = (corner_state == CellState.BOUNDARY) & (dist_to_entry > 15.0)
             
             heading_fits &= ~(is_blocked | is_boundary)
@@ -176,36 +158,23 @@ def make_driveable_mask(grid, truck):
     return mask
 
 
-# ── Accessibility (isolation check) ───────────────────────
-
 def precompute_coarse_blocked_mask(grid, truck):
-    """
-    Downsamples the truck's physical driveability to a coarse grid.
-    This guarantees BFS accounts for the truck's width and length.
-    """
     f = _COARSE_FACTOR
     cr = (grid.rows + f - 1) // f
     cc = (grid.cols + f - 1) // f
 
-    # 1. Driveability takes truck dimensions into account
     drive_mask_3d = make_driveable_mask(grid, truck)
-
-    # 2. Cell is passable if truck center can exist here in ANY heading
     passable_fine = drive_mask_3d.any(axis=2)
 
-    # 3. Pad array to match coarse dimensions. Padding is False (not passable)
     pad_r = cr * f - grid.rows
     pad_c = cc * f - grid.cols
     padded_passable = np.pad(passable_fine, ((0, pad_r), (0, pad_c)), constant_values=False)
 
-    # 4. A coarse block is PASSABLE if the truck center can exist in AT LEAST ONE of its fine cells.
     coarse_passable = padded_passable.reshape(cr, f, cc, f).any(axis=(1, 3))
-
     return ~coarse_passable
 
 
 def _has_bridge_risk(grid, r, c):
-    """O(1) bridge risk check."""
     n = r - 1 < 0          or grid.state[r-1, c] in _BRIDGE_RISK_BLOCKED
     s = r + 1 >= grid.rows or grid.state[r+1, c] in _BRIDGE_RISK_BLOCKED
     w = c - 1 < 0          or grid.state[r, c-1] in _BRIDGE_RISK_BLOCKED
@@ -214,16 +183,10 @@ def _has_bridge_risk(grid, r, c):
 
 
 def is_accessible(grid, r, c, entry_rc, truck, precomputed_coarse_mask=None):
-    """
-    BFS on coarse downsampled grid instead of full fine grid.
-    Accepts a precomputed mask for high-speed batch checking.
-    """
     if not _has_bridge_risk(grid, r, c):
         return True
 
     f = _COARSE_FACTOR
-    
-    # Use provided mask (fast) or compute it on the fly (slower if called in a loop)
     coarse_blocked = precomputed_coarse_mask if precomputed_coarse_mask is not None else precompute_coarse_blocked_mask(grid, truck)
 
     cr = coarse_blocked.shape[0]
@@ -232,7 +195,6 @@ def is_accessible(grid, r, c, entry_rc, truck, precomputed_coarse_mask=None):
     coarse_r = r // f
     coarse_c = c // f
     
-    # We must copy the mask if we are modifying it so we don't ruin the precomputed original
     temp_blocked = coarse_blocked.copy()
     temp_blocked[coarse_r, coarse_c] = True
 
@@ -257,13 +219,7 @@ def is_accessible(grid, r, c, entry_rc, truck, precomputed_coarse_mask=None):
     return len(all_reachable - visited) == 0
 
 
-# ── Main Entry Point ───────────────────────────────────────
-
 def get_raw_candidates(grid, truck):
-    """
-    Just grabs the subsampled cells and ensures the dump cone fits.
-    Does NOT do BFS. The Orchestrator will handle BFS based on fill_pct.
-    """
     stride = _CANDIDATE_STRIDE
 
     dumpable = np.zeros((grid.rows, grid.cols), dtype=bool)

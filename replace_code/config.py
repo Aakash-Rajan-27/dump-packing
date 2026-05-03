@@ -51,7 +51,7 @@ TRUCK_CLASSES = {
 
 FLEET_COMPOSITION = {
     'small':  2,
-    'medium': 2,
+    'medium': 1,
     'large':  1,
 }
 

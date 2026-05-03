@@ -1,24 +1,7 @@
 # renderer.py
 # ─────────────────────────────────────────────────────────────
-# Changes from previous version:
-#
-# 1. Auto-scale accounts for fine grid (181x181 at 0.5m)
-#    Old: scale = screen_h * 0.85 / grid.rows
-#         At 31 rows: scale=21px/cell (each cell = 21px = 3m)
-#    New: same formula, but grid.rows=181 at 0.5m cells
-#         scale = 768*0.85/181 = 3.6 → rounded to max(2, ...)
-#         Each 0.5m cell = 3-4px → groups of 6 cells = one old 3m cell = 18-24px
-#    Physical truck dimensions still correct because world_to_px uses metres.
-#
-# 2. _draw_grid() — height map visualisation improved
-#    Old: simple colour blend per state
-#    New: uses z_height directly for colour intensity on ALL material cells
-#         (both PARTIAL and FILLED). This gives a true continuous height map
-#         appearance — cells smoothly darken from green→orange→brown as they fill.
-#         At 0.5m resolution this produces a smooth gradient across the polygon.
-#
-# 3. All other drawing (trucks, panel, dump radii) unchanged —
-#    world_to_px uses real metres so scales automatically.
+# FIX: Added surface wiping to prevent ghosting/trailing trucks.
+# FIX: Reverted Pheromone rendering logic.
 # ─────────────────────────────────────────────────────────────
 
 import pygame
@@ -40,19 +23,12 @@ CELL_COLOURS = {
 PANEL_W  = 280
 PANEL_BG = (20, 20, 30)
 
-# Colour keyframes for height-based blending:
-# z=0 → green (EMPTY), z=mid → orange (PARTIAL), z=full → dark brown (FILLED)
 _COL_EMPTY   = np.array([140, 190, 140], dtype=float)
 _COL_PARTIAL = np.array([200, 140,  60], dtype=float)
 _COL_FILLED  = np.array([110,  70,  30], dtype=float)
 
 
 def _height_colour(z_norm):
-    """
-    Map normalised height z_norm ∈ [0,1] to RGB tuple.
-    0.0 → green (empty), 0.5 → orange (partial), 1.0 → dark brown (full).
-    Uses two-segment linear blend for smooth gradient.
-    """
     if z_norm <= 0.5:
         t = z_norm * 2.0
         rgb = _COL_EMPTY + t * (_COL_PARTIAL - _COL_EMPTY)
@@ -72,8 +48,6 @@ class Renderer:
         screen_w = info.current_w
 
         if scale is None:
-            # CHANGED: max(2,...) instead of max(8,...) to handle fine grid
-            # At 181 rows and 768px screen: scale = int(768*0.85/181) = 3
             self.scale = max(2, int(screen_h * 0.85) // grid.rows)
         else:
             self.scale = scale
@@ -117,17 +91,12 @@ class Renderer:
         pygame.display.flip()
 
     def _draw_grid(self):
-        """
-        CHANGED: height-map based colouring for material cells.
-        Old: separate colour logic for PARTIAL vs FILLED states
-        New: any cell with z_height > 0 gets colour from _height_colour(z/TARGET)
-             producing a smooth continuous gradient across the fine grid.
-             At 0.5m resolution this is visually smooth like a real height map.
-        """
+        # THE FIX: Wipe the canvas clean every frame to stop ghost trails
+        self.grid_surface.fill((0, 0, 0))
+        
         g = self.grid
         s = self.scale
 
-        # Pre-compute normalised height array for all cells
         z_norm = np.clip(g.z_height / TARGET_PILE_HEIGHT, 0.0, 1.0)
 
         for r in range(g.rows):
@@ -138,10 +107,10 @@ class Renderer:
                     colour = CELL_COLOURS[CellState.BOUNDARY]
 
                 elif state in (CellState.PARTIAL, CellState.FILLED):
-                    # CHANGED: use continuous height-based colour
                     colour = _height_colour(z_norm[r, c])
 
                 elif state == CellState.EMPTY:
+                    # PHEROMONE LOGIC REVERTED TO ACTIVE
                     ph    = g.pheromone[r, c]
                     base  = CELL_COLOURS[CellState.EMPTY]
                     r_val = min(255, int(base[0] + (1 - ph) * 50))
@@ -171,37 +140,29 @@ class Renderer:
             self.grid_surface.blit(surf, (px-cone_r_px-1, py-cone_r_px-1))
 
     def _draw_truck(self, truck):
-        # Real pixel dimensions from metres
         w_px_real = self.metres_to_px(truck.width)
         l_px_real = self.metres_to_px(truck.length)
 
-        # Cap drawn size so trucks never exceed ~80px longest dimension
-        # on screen — keeps them visible without overwhelming the grid.
-        # The cap scales with screen size but never goes below 12px.
         max_dim = max(20, self.grid_h // 12)
         scale_factor = min(1.0, max_dim / max(w_px_real, l_px_real))
         w_px = max(6,  int(w_px_real * scale_factor))
         l_px = max(10, int(l_px_real * scale_factor))
 
-        # Build truck rectangle surface (length along x before rotation)
         truck_surf = pygame.Surface((l_px, w_px), pygame.SRCALPHA)
 
-        # Body fill
         pygame.draw.rect(truck_surf, truck.colour,
                          (0, 0, l_px, w_px), border_radius=2)
-        # White outline
         pygame.draw.rect(truck_surf, (255, 255, 255),
                          (0, 0, l_px, w_px), 1, border_radius=2)
-        # Cab marker — darker front quarter
+                         
         cab_w = max(3, l_px // 4)
         cab_colour = tuple(max(0, v - 60) for v in truck.colour)
         pygame.draw.rect(truck_surf, cab_colour,
                          (l_px - cab_w, 0, cab_w, w_px), border_radius=1)
-        # Centre line
+                         
         pygame.draw.line(truck_surf, (255, 255, 255),
                          (0, w_px // 2), (l_px, w_px // 2), 1)
 
-        # Rotate to heading (pygame rotates CCW, heading CCW from east)
         heading_deg = math.degrees(truck.heading)
         rotated = pygame.transform.rotate(truck_surf, -heading_deg)
 
@@ -209,8 +170,6 @@ class Renderer:
         rect = rotated.get_rect(center=(px, py))
         self.grid_surface.blit(rotated, rect)
 
-        # Status colour ring around truck centre
-        # Green = navigating, yellow = reversing, red = dumping, grey = idle
         status_colours = {
             truck.STATUS_IDLE:       (120, 120, 120),
             truck.STATUS_NAVIGATING: ( 80, 220,  80),
@@ -221,16 +180,12 @@ class Renderer:
         ring_r   = max(4, w_px // 2 + 2)
         pygame.draw.circle(self.grid_surface, ring_col, (px, py), ring_r, 2)
 
-        # Heading arrow — short line from truck centre in heading direction
-        # Length = half the drawn truck length, not the real length
         arrow_len = max(8, l_px // 2 + 4)
         tip_x = int(px + arrow_len * math.cos(truck.heading))
         tip_y = int(py + arrow_len * math.sin(truck.heading))
         pygame.draw.line(self.grid_surface, (255, 255, 255),
                          (px, py), (tip_x, tip_y), 2)
 
-        # Arrowhead — two lines at ±150° from forward direction
-        # (±150° from forward = ±30° opening angle at the tip)
         head_len = max(4, arrow_len // 3)
         for angle_offset in (math.pi * 5/6, -math.pi * 5/6):
             hx = int(tip_x + head_len * math.cos(truck.heading + angle_offset))
@@ -238,7 +193,6 @@ class Renderer:
             pygame.draw.line(self.grid_surface, (255, 255, 255),
                              (tip_x, tip_y), (hx, hy), 2)
 
-        # Label above truck
         label = self.font_tiny.render(
             f"{truck.label}{truck.id}", True, (255, 255, 255))
         self.grid_surface.blit(label, (px - label.get_width() // 2,

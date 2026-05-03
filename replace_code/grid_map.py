@@ -25,6 +25,20 @@
 # 5. All other methods unchanged.
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# REALISTIC SANDPILE PHYSICS ADDED
+# Replaces simple block-dumping with volumetric cone spreading 
+# and angle-of-repose relaxation. Vectorized classification kept.
+# ─────────────────────────────────────────────────────────────
+
+# grid_map.py
+# ─────────────────────────────────────────────────────────────
+# REALISTIC SANDPILE PHYSICS ADDED
+# Replaces simple block-dumping with volumetric cone spreading 
+# and angle-of-repose relaxation. Vectorized classification kept.
+# Includes "Anti-Freeze" check in the physics loop to stop infinite Zeno paradoxes.
+# ─────────────────────────────────────────────────────────────
+
 import math
 import numpy as np
 import shapely
@@ -63,20 +77,10 @@ class GridMap:
         self._mark_entry_corridor()
 
     def _classify_cells(self):
-        """
-        CHANGED: vectorized using shapely.contains_xy.
-        Old: loop calling shapely.contains(Point(x,y)) per cell = 410ms at 0.5m
-        New: build arrays of all cell centre coords, one batch call = 9ms
-
-        At CELL_SIZE=0.5m this grid has 181x181=32761 cells.
-        The old per-point approach would take 410ms just for initialisation.
-        """
-        # Build arrays of all cell centre coordinates
         rows_idx, cols_idx = np.mgrid[0:self.rows, 0:self.cols]
         xs = self.origin[0] + cols_idx * self.cell_size + self.cell_size / 2
         ys = self.origin[1] + rows_idx * self.cell_size + self.cell_size / 2
 
-        # Single vectorized containment check
         inside = shapely.contains_xy(
             self.polygon,
             xs.ravel(),
@@ -86,11 +90,6 @@ class GridMap:
         self.state[inside] = CellState.EMPTY
 
     def _mark_entry_corridor(self):
-        """
-        CHANGED: uses ENTRY_CORRIDOR_CELLS instead of hardcoded range(-1,2).
-        Old: 3-cell wide corridor (fine at 3m → 9m physical buffer)
-        New: ENTRY_CORRIDOR_CELLS=6 at 0.5m → same 3m physical buffer
-        """
         from config import ENTRY_POINT
         er, ec = self.world_to_cell(*ENTRY_POINT)
         half = ENTRY_CORRIDOR_CELLS
@@ -100,8 +99,6 @@ class GridMap:
                 if 0 <= nr < self.rows and 0 <= nc < self.cols:
                     if self.state[nr, nc] == CellState.EMPTY:
                         self.state[nr, nc] = CellState.PROTECTED
-
-    # ── Coordinate Conversion ──────────────────────────────
 
     def cell_to_world(self, r, c):
         x = self.origin[0] + c * self.cell_size + self.cell_size / 2
@@ -115,15 +112,7 @@ class GridMap:
         r = max(0, min(r, self.rows - 1))
         return (r, c)
 
-    # ── Metrics ────────────────────────────────────────────
-
     def fill_pct(self):
-        """
-        Fraction of valid cells at full height (>= TARGET_PILE_HEIGHT).
-        At 0.5m resolution this is now a meaningful continuous metric:
-        a region is 'full' only when every 0.5m subcell has reached
-        TARGET_PILE_HEIGHT — much stricter than the old 3m cell fill.
-        """
         valid  = np.sum((self.state == CellState.EMPTY)   |
                         (self.state == CellState.PARTIAL)  |
                         (self.state == CellState.FILLED)   |
@@ -132,11 +121,6 @@ class GridMap:
         return filled / max(1, valid)
 
     def pack_pct(self):
-        """
-        Average z_height / TARGET_PILE_HEIGHT across all valid cells.
-        This is the true packing density metric — it reflects partial
-        fills at fine resolution, not just binary filled/empty.
-        """
         valid_mask = ((self.state == CellState.EMPTY)   |
                       (self.state == CellState.PARTIAL)  |
                       (self.state == CellState.FILLED)   |
@@ -149,59 +133,74 @@ class GridMap:
             / (total_valid * TARGET_PILE_HEIGHT)
         )
 
-    # ── Dump ───────────────────────────────────────────────
-
-    def dump_at(self, r, c, pile_height_per_dump):
-        """
-        Cone-shaped dump. Logic unchanged from previous version.
-        At 0.5m cells this now naturally produces a smooth height map:
-          - small truck (0.6m, cone_r=0.86m): affects ~9 cells
-          - medium truck (1.8m, cone_r=2.57m): affects ~83 cells
-          - large truck (3.2m, cone_r=4.57m): affects ~262 cells
-
-        Overlapping dumps superpose (heights add up).
-        State is derived from z_height after each update:
-          z >= TARGET_PILE_HEIGHT → FILLED
-          z > 0                   → PARTIAL
-        """
-        cone_radius = pile_height_per_dump / _TAN_REPOSE
-        cell_radius = int(math.ceil(cone_radius / self.cell_size))
-        cx, cy = self.cell_to_world(r, c)
-
-        for dr in range(-cell_radius, cell_radius + 1):
-            for dc in range(-cell_radius, cell_radius + 1):
-                nr, nc = r + dr, c + dc
-                if not (0 <= nr < self.rows and 0 <= nc < self.cols):
+    def dump_at(self, r, c, volume_m3):
+        tan_theta = _TAN_REPOSE
+        r_pile_m  = (3 * volume_m3 / (np.pi * tan_theta)) ** (1/3)
+        r_cells   = r_pile_m / self.cell_size
+        
+        rmin = max(0, r - int(math.ceil(r_cells)))
+        rmax = min(self.rows, r + int(math.ceil(r_cells)) + 1)
+        cmin = max(0, c - int(math.ceil(r_cells)))
+        cmax = min(self.cols, c + int(math.ceil(r_cells)) + 1)
+        
+        for i in range(rmin, rmax):
+            for j in range(cmin, cmax):
+                if self.state[i, j] == CellState.BOUNDARY:
                     continue
-                if self.state[nr, nc] == CellState.BOUNDARY:
-                    continue
+                    
+                dist_cells = math.hypot(i - r, j - c)
+                dist_m = dist_cells * self.cell_size
+                
+                if dist_m < r_pile_m:
+                    added_height = (r_pile_m - dist_m) * tan_theta
+                    self.z_height[i, j] += added_height
+                    
+        max_dz = tan_theta * self.cell_size
+        changed = True
+        
+        rx_min, rx_max = max(1, rmin - 4), min(self.rows - 1, rmax + 4)
+        cx_min, cx_max = max(1, cmin - 4), min(self.cols - 1, cmax + 4)
+        
+        while changed:
+            changed = False
+            for i in range(rx_min, rx_max):
+                for j in range(cx_min, cx_max):
+                    if self.state[i, j] in (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE, CellState.PROTECTED):
+                        continue
+                        
+                    for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        ni, nj = i + di, j + dj
+                        
+                        if self.state[ni, nj] in (CellState.BOUNDARY, CellState.OBSTACLE, CellState.PROTECTED):
+                            continue
+                            
+                        dz = self.z_height[i, j] - self.z_height[ni, nj]
+                        if dz > max_dz:
+                            transfer = (dz - max_dz) / 2.0
+                            
+                            # THE ANTI-FREEZE FIX: Ignore microscopic dirt movements
+                            if transfer > 0.005: 
+                                self.z_height[i, j]   -= transfer
+                                self.z_height[ni, nj] += transfer
+                                changed = True
 
-                nx, ny = self.cell_to_world(nr, nc)
-                dist   = math.hypot(nx - cx, ny - cy)
-                if dist > cone_radius:
-                    continue
+        for i in range(rx_min, rx_max):
+            for j in range(cx_min, cx_max):
+                self._update_state(i, j)
+                if self.z_height[i, j] > 0:
+                    self.pheromone[i, j] = 0.0
 
-                h_contrib = max(0.0, pile_height_per_dump - dist * _TAN_REPOSE)
-                if h_contrib <= 0.0:
-                    continue
-
-                self.z_height[nr, nc] = min(
-                    self.z_height[nr, nc] + h_contrib,
-                    TARGET_PILE_HEIGHT
-                )
-
-                cur   = self.state[nr, nc]
-                new_h = self.z_height[nr, nc]
-                if cur in (CellState.RESERVED, CellState.PROTECTED):
-                    continue
-                if new_h >= TARGET_PILE_HEIGHT:
-                    self.state[nr, nc] = CellState.FILLED
-                elif new_h > 0:
-                    self.state[nr, nc] = CellState.PARTIAL
-
-        self.pheromone[r, c] = 0.0
-
-    # ── State Mutations ────────────────────────────────────
+    def _update_state(self, r, c):
+        if self.state[r, c] in (CellState.BOUNDARY, CellState.PROTECTED, CellState.OBSTACLE, CellState.RESERVED):
+            return
+            
+        z = self.z_height[r, c]
+        if z >= TARGET_PILE_HEIGHT:
+            self.state[r, c] = CellState.FILLED
+        elif z > 0:
+            self.state[r, c] = CellState.PARTIAL
+        else:
+            self.state[r, c] = CellState.EMPTY
 
     def reserve(self, r, c):
         if self.state[r, c] in (CellState.EMPTY, CellState.PARTIAL):
@@ -209,13 +208,7 @@ class GridMap:
 
     def unreserve(self, r, c):
         if self.state[r, c] == CellState.RESERVED:
-            h = self.z_height[r, c]
-            if h >= TARGET_PILE_HEIGHT:
-                self.state[r, c] = CellState.FILLED
-            elif h > 0:
-                self.state[r, c] = CellState.PARTIAL
-            else:
-                self.state[r, c] = CellState.EMPTY
+            self._update_state(r, c)
 
     def is_dumpable(self, r, c):
         if self.state[r, c] in (CellState.BOUNDARY, CellState.PROTECTED,

@@ -18,7 +18,7 @@ _MAX_TURN_RADIUS = 33.0
 def build_cost_matrix(trucks, dump_points, grid):
     """
     Build N×M cost matrix.  
-    C[i][j] = cost of sending truck i to dump point j.
+    C[i][j] = cost of sending truck i to dumgit addp point j.
 
     Cost components:
       - Normalised Euclidean distance (primary)
