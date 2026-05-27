@@ -88,7 +88,7 @@ def run_simulation():
             top_candidates = []
             coarse_mask = precompute_coarse_blocked_mask(grid, repr_truck)
 
-            if fp < CONFIG_MATERIAL_HEIGHT_THRESHOLD:
+            if fp < CONFIG_MATERIAL_HEIGHT_THRESHOLD: 
                 scores = score_candidates(grid, raw_candidates)
                 top_indices = scores.argsort()[::-1]
                 

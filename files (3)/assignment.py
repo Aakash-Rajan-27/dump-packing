@@ -80,7 +80,7 @@ def build_cost_matrix(trucks, dump_points, grid):
             norm_heading = delta / np.pi
 
             # ── Combined cost ──────────────────────────────
-            C[i, j] = W_DISTANCE * norm_dist + W_HEADING * norm_heading
+            C[i, j] = W_DISTANCE * norm_dist + W_HEADING * norm_heading #FIX - WEIGHTS of cost matrix
             # e.g. 1.0 * 0.3 + 0.4 * 0.5 = 0.5 total cost
 
     return C
