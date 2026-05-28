@@ -13,7 +13,8 @@ import heapq  # min-heap for A* open set (priority queue)
 import numpy as np  # array operations
 import math  # math.hypot for distance
 from filters import make_driveable_mask  # builds a 3-D boolean mask: [row, col, heading_bucket] → can drive here?
-from config import DRIVE_CLEARANCE_M, _TAN_REPOSE, ENTRY_POINT  # 0.4 m clearance limit, tan(angle of repose), gate coords
+from config import (DRIVE_CLEARANCE_M, _TAN_REPOSE, ENTRY_POINT,
+                    MIN_TURN_RADIUS_M, TRUCK_INTERP_STEPS_PER_COARSE)  # clearance, tan(angle), gate coords, turning controls
 
 # Maps each of the 4 cardinal (row, col) step directions to an integer "bucket" index.
 # The driveable mask's third dimension is indexed by this bucket so we can have
@@ -28,11 +29,101 @@ _DIR_TO_BUCKET = {
     ( 1,  0): 6,  # down
     ( 1,  1): 7,  # down-right
 }
+_BUCKET_TO_DIR = {bucket: delta for delta, bucket in _DIR_TO_BUCKET.items()}
+_BUCKET_TO_HEADING = {
+    0: 0.0,
+    1: -math.pi / 4,
+    2: -math.pi / 2,
+    3: -3 * math.pi / 4,
+    4: math.pi,
+    5: 3 * math.pi / 4,
+    6: math.pi / 2,
+    7: math.pi / 4,
+}
 
 def _heading_bucket(dr, dc):
     # Convert a (row_delta, col_delta) step into its driveable-mask bucket index.
     # Falls back to bucket 0 if the direction isn't in the lookup table.
     return _DIR_TO_BUCKET.get((dr, dc), 0)
+
+def _angle_diff_signed(target, current):
+    return (target - current + math.pi) % (2 * math.pi) - math.pi
+
+def _bucket_from_heading(heading):
+    best_bucket = 0
+    best_delta = float('inf')
+    for bucket, bucket_heading in _BUCKET_TO_HEADING.items():
+        delta = abs(_angle_diff_signed(bucket_heading, heading))
+        if delta < best_delta:
+            best_bucket = bucket
+            best_delta = delta
+    return best_bucket
+
+def _heading_for_bucket(bucket):
+    return _BUCKET_TO_HEADING[bucket % 8]
+
+def _state_cell(state):
+    return (state[0], state[1])
+
+def _path_cells(grid, path):
+    cells = []
+    for wp in path or []:
+        if len(wp) == 3 and not isinstance(wp[0], (int, np.integer)):
+            cells.append(grid.world_to_cell(wp[0], wp[1]))
+        else:
+            cells.append((wp[0], wp[1]))
+    return cells
+
+def _coarse_state_to_pose(grid, state):
+    r, c = state[0], state[1]
+    x, y = grid.cell_to_world(r, c)
+    heading = state[2] if len(state) == 3 else 0.0
+    return x, y, heading
+
+def _hermite_pose(x0, y0, h0, x1, y1, h1, t):
+    dx = x1 - x0
+    dy = y1 - y0
+    dist = max(1e-9, math.hypot(dx, dy))
+    tangent_scale = dist * 0.5
+
+    m0x = math.cos(h0) * tangent_scale
+    m0y = math.sin(h0) * tangent_scale
+    m1x = math.cos(h1) * tangent_scale
+    m1y = math.sin(h1) * tangent_scale
+
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2 * t3 - 3 * t2 + 1
+    h10 = t3 - 2 * t2 + t
+    h01 = -2 * t3 + 3 * t2
+    h11 = t3 - t2
+
+    x = h00 * x0 + h10 * m0x + h01 * x1 + h11 * m1x
+    y = h00 * y0 + h10 * m0y + h01 * y1 + h11 * m1y
+
+    dh00 = 6 * t2 - 6 * t
+    dh10 = 3 * t2 - 4 * t + 1
+    dh01 = -6 * t2 + 6 * t
+    dh11 = 3 * t2 - 2 * t
+    vx = dh00 * x0 + dh10 * m0x + dh01 * x1 + dh11 * m1x
+    vy = dh00 * y0 + dh10 * m0y + dh01 * y1 + dh11 * m1y
+
+    heading = math.atan2(vy, vx) if abs(vx) > 1e-9 or abs(vy) > 1e-9 else h1
+    return x, y, heading
+
+def interpolate_path_to_truck_states(grid, truck, coarse_path):
+    if getattr(truck, 'turn_radius', 0.0) < MIN_TURN_RADIUS_M:
+        return []
+
+    states = [(float(truck.pos[0]), float(truck.pos[1]), float(truck.heading))]
+    for coarse_state in coarse_path:
+        tx, ty, target_heading = _coarse_state_to_pose(grid, coarse_state)
+        x, y, heading = states[-1]
+        for i in range(1, TRUCK_INTERP_STEPS_PER_COARSE + 1):
+            t = i / TRUCK_INTERP_STEPS_PER_COARSE
+            states.append(_hermite_pose(x, y, heading, tx, ty, target_heading, t))
+
+    return states[1:]
 
 def _turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells):
     # Penalise direction changes to discourage zig-zag paths.
@@ -43,68 +134,74 @@ def _turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells):
     return 0.0 if dot == 1 else turn_radius_cells * 0.3
 
 def astar(driveable, grid, start_rc, goal_rc, truck, blocked_cells=frozenset(), stop_dist_cells=0.0):
-    turn_radius_cells = truck.turn_radius / grid.cell_size  # convert metres to cell units for the turn cost formula
-    rows, cols        = driveable.shape[:2]                  # grid dimensions used for boundary checks
+    turn_radius_cells = truck.turn_radius / grid.cell_size
+    rows, cols        = driveable.shape[:2]
 
-    # Heap entries: (f_cost, g_cost, row, col, prev_dr, prev_dc)
-    open_heap = [(0.0, 0.0, start_rc[0], start_rc[1], None, None)]  # seed with start node, zero cost
-    came_from = {}               # maps (r,c) → (parent_r, parent_c) for path reconstruction
-    g_cost    = {start_rc: 0.0} # best known cost from start to each visited cell
+    start_hb    = _bucket_from_heading(truck.heading)
+    start_state = (start_rc[0], start_rc[1], start_hb)
 
-    # ─── THE FIX: CLOSEST APPROACH TRACKER ───
-    closest_node = start_rc  # if we never reach the goal radius, return the nearest node we found
-    min_dist_to_target = math.hypot(start_rc[0] - goal_rc[0], start_rc[1] - goal_rc[1])  # baseline distance for comparison
+    open_heap = [(0.0, 0.0, start_rc[0], start_rc[1], start_hb)]
+    came_from = {}
+    g_cost    = {start_state: 0.0}
+
+    closest_state = start_state
+    min_dist_to_target = math.hypot(start_rc[0] - goal_rc[0], start_rc[1] - goal_rc[1])
 
     while open_heap:
-        f, g, r, c, prev_dr, prev_dc = heapq.heappop(open_heap)  # expand the cheapest known node
+        f, g, r, c, hb = heapq.heappop(open_heap)
+        state = (r, c, hb)
 
-        # Track how close we are getting
-        dist_to_target = math.hypot(r - goal_rc[0], c - goal_rc[1])  # Euclidean distance to goal in cell units
-        if dist_to_target < min_dist_to_target:  # new closest node found
+        dist_to_target = math.hypot(r - goal_rc[0], c - goal_rc[1])
+        if dist_to_target < min_dist_to_target:
             min_dist_to_target = dist_to_target
-            closest_node = (r, c)
+            closest_state = state
 
-        # ─── RADIUS GOAL CHECK ───
-        if dist_to_target <= stop_dist_cells:  # truck is within the safe stopping radius of the target
-            closest_node = (r, c)              # record this as the final node
-            break                              # stop searching — we're close enough
+        if dist_to_target <= stop_dist_cells:
+            closest_state = state
+            break
 
-        if g > g_cost.get((r, c), float('inf')): continue  # stale heap entry (cheaper path already found) — skip
+        if g > g_cost.get(state, float('inf')):
+            continue
 
-        for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):  # explore 4-connected neighbours (no diagonals)
-            nr, nc = r + dr, c + dc
-            if not (0 <= nr < rows and 0 <= nc < cols): continue  # skip out-of-bounds cells
+        next_states = []
+        for turn in (-1, 0, 1):
+            next_hb = (hb + turn) % 8
+            dr, dc = _BUCKET_TO_DIR[next_hb]
+            turn_cost = 0.0 if turn == 0 else 0.35 * turn_radius_cells
+            next_states.append((r + dr, c + dc, next_hb, math.hypot(dr, dc) + turn_cost))
 
-            hb = _heading_bucket(dr, dc)               # get the mask bucket for this travel direction
-            if not driveable[nr, nc, hb]: continue     # skip cells that aren't driveable in this direction
+        for nr, nc, nhb, action_cost in next_states:
+            if not (0 <= nr < rows and 0 <= nc < cols):
+                continue
 
-            traffic_cost = 10.0 if (nr, nc) in blocked_cells else 0.0  # soft penalty for cells occupied by other trucks
-            tc = _turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells)  # penalty for changing direction
-            new_g = g + 1.0 + tc + traffic_cost  # total cost: 1 cell step + turn penalty + traffic penalty
+            if not driveable[nr, nc, nhb]:
+                continue
 
-            if new_g < g_cost.get((nr, nc), float('inf')):  # only update if this is a better path to (nr, nc)
-                g_cost[(nr, nc)] = new_g  # record the best cost
-                h = abs(nr - goal_rc[0]) + abs(nc - goal_rc[1])  # Manhattan heuristic (admissible for 4-connected grid)
-                heapq.heappush(open_heap, (new_g + h, new_g, nr, nc, dr, dc))  # add to open set
-                came_from[(nr, nc)] = (r, c)  # record how we reached this cell
+            traffic_cost = 10.0 if (nr, nc) in blocked_cells else 0.0
+            new_g = g + action_cost + traffic_cost
+            next_state = (nr, nc, nhb)
 
-    # ─── PATH RECONSTRUCTION (Never returns [] unless totally trapped) ───
-    # It builds the path to the closest safe node it found!
-    path, cur = [], closest_node  # walk back from closest/goal node to start via came_from
+            if new_g < g_cost.get(next_state, float('inf')):
+                g_cost[next_state] = new_g
+                h = abs(nr - goal_rc[0]) + abs(nc - goal_rc[1])
+                heapq.heappush(open_heap, (new_g + h, new_g, nr, nc, nhb))
+                came_from[next_state] = state
+
+    path, cur = [], closest_state
     while cur in came_from:
-        path.append(cur)
+        path.append((cur[0], cur[1], _heading_for_bucket(cur[2])))
         cur = came_from[cur]
-    path.reverse()  # reverse so path goes start → goal
+    path.reverse()
 
     return path
-
 def plan_paths(grid, assignments, existing_paths=None):
     if not assignments: return {}  # nothing to plan
 
     current_truck_cells = set()  # cells currently occupied by trucks — used to build soft obstacles
     if existing_paths is not None:
          for p in existing_paths.values():
-             if p: current_truck_cells.add(p[0])  # treat the front of each existing path as a "soft block"
+             cells = _path_cells(grid, p)
+             if cells: current_truck_cells.add(cells[0])  # treat the front of each existing path as a "soft block"
 
     for truck, _ in assignments:
          current_truck_cells.add(grid.world_to_cell(*truck.pos))  # add each truck's current cell
@@ -138,15 +235,16 @@ def plan_paths(grid, assignments, existing_paths=None):
             stop_dist_cells = safe_dist_m / grid.cell_size                                  # convert metres to cells
 
         # GHOST MODE ACTIVATED: We pass frozenset() so it ignores 'obstacles' entirely
-        path = astar(driveable, grid, truck_cell, target_rc, truck,
-                     blocked_cells=frozenset(), stop_dist_cells=stop_dist_cells)  # plan path ignoring other trucks to prevent traffic deadlocks
+        coarse_path = astar(driveable, grid, truck_cell, target_rc, truck,
+                            blocked_cells=frozenset(), stop_dist_cells=stop_dist_cells)  # plan path ignoring other trucks to prevent traffic deadlocks
+        path = interpolate_path_to_truck_states(grid, truck, coarse_path)
         paths[truck.id] = path  # store path keyed by truck ID
 
-        if path:
-             current_truck_cells.add(path[0])  # register the truck's next cell as soft-blocked for subsequent trucks
+        if coarse_path:
+             current_truck_cells.add(_state_cell(coarse_path[0]))  # register the truck's next cell as soft-blocked for subsequent trucks
 
         # --- DEBUG PRINT ---
-        print(f"DEBUG: Truck {truck.id} ({truck.truck_class}) Target: {target_rc} Path Nodes: {len(path)} StopDistCells: {stop_dist_cells:.2f}")
+        print(f"DEBUG: Truck {truck.id} ({truck.truck_class}) Target: {target_rc} Coarse Nodes: {len(coarse_path)} Path Nodes: {len(path)} StopDistCells: {stop_dist_cells:.2f}")
 
     # ─── ADD THIS BLOCK FOR PPT MAPF LOG (Slide 7) ───
     if not hasattr(plan_paths, "call_count"):
@@ -274,7 +372,7 @@ def _detect_first_conflict(paths_dict):
         # After the path ends the truck is considered to stay at its final cell forever.
         if not path:
             return None
-        return path[min(t, len(path) - 1)]  # clamp t to the last index so the truck "stays" at its goal
+        return _state_cell(path[min(t, len(path) - 1)])  # clamp t so the truck "stays" at its goal
 
     for t in range(max_t + 1):  # check every timestep from 0 to the end of the longest path
 
@@ -342,7 +440,7 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
     locked_spatial = set()  # set of (r, c) cells occupied by any locked truck
     if locked_paths:
         for path in locked_paths.values():
-            locked_spatial.update(path)  # every cell the locked truck will visit
+            locked_spatial.update(_path_cells(grid, path))  # every cell the locked truck will visit
     locked_spatial_frozen = frozenset(locked_spatial)  # immutable for repeated use inside low_level
 
     # ── PER-AGENT SETUP ───────────────────────────────────────────────────────────
@@ -391,8 +489,14 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
             d    = math.hypot(info['start'][0] - info['target'][0],
                               info['start'][1] - info['target'][1])
             if d <= info['stop_dist']:
-                return [info['start']]
+                return [(info['start'][0], info['start'][1], info['truck'].heading)]
         return path
+
+    def smooth_paths(coarse_paths):
+        return {
+            aid: interpolate_path_to_truck_states(grid, agent_info[aid]['truck'], path)
+            for aid, path in coarse_paths.items()
+        }
 
     def low_level(agent_id, constraints_dict):
         # Plan one agent with plain A*.
@@ -416,7 +520,7 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         aid  = next(iter(agent_info))
         path = low_level(aid, {})  # single plain-A* call
         print(f"[CBS] Single-agent. Truck {aid}: {len(path)} nodes")
-        return {aid: path}
+        return smooth_paths({aid: path})
 
     # ── CBS HIGH-LEVEL SEARCH ─────────────────────────────────────────────────────
     # Root: plan every truck independently with no CBS constraints yet.
@@ -439,7 +543,7 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
 
         if conflict is None:  # no conflicts — done
             print(f"[CBS] Conflict-free. Cost={cost}, trucks={list(paths.keys())}")
-            return paths
+            return smooth_paths(paths)
 
         # Branch: add one constraint per conflicting agent and replan that agent.
         if conflict[0] == 'vertex':
@@ -462,5 +566,5 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
     print(f"[CBS] Budget exhausted — returning best available paths")
     if heap:
         _, _, _, best = heap[0]
-        return best
-    return init_paths
+        return smooth_paths(best)
+    return smooth_paths(init_paths)

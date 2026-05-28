@@ -155,29 +155,33 @@ def run_simulation():
                         truck_path = paths.get(truck.id, [])
                         truck.set_path(truck_path, dump_point, grid)
 
-        # ── MOVEMENT PHASE (Will always run now) ───────────────────
+        # Movement / render phase. Draw every fine truck step; batching several
+        # steps before drawing hides the interpolated arc and makes turns look
+        # like stop-rotate-go.
         for _ in range(STEPS_PER_TICK):
+            if renderer.check_quit():
+                done = True
+                break
+
             for truck in trucks:
                 truck.step(grid)
 
-        # ── PHEROMONE PHASE (Blue Smudge Fix) ──────────────────────
-        grid.pheromone = 1.0 - (1.0 - grid.pheromone) * PHEROMONE_DECAY
-        grid.pheromone = gaussian_filter(grid.pheromone, sigma=PHEROMONE_SPREAD_SIGMA)
-        np.clip(grid.pheromone, 0.0, 1.0, out=grid.pheromone)
+            grid.pheromone = 1.0 - (1.0 - grid.pheromone) * PHEROMONE_DECAY
+            grid.pheromone = gaussian_filter(grid.pheromone, sigma=PHEROMONE_SPREAD_SIGMA)
+            np.clip(grid.pheromone, 0.0, 1.0, out=grid.pheromone)
 
-        metrics = {
-            'tick':       tick,
-            'fleet':      f"{FLEET_COMPOSITION['small']}S/{FLEET_COMPOSITION['medium']}M/{FLEET_COMPOSITION['large']}L",
-            'idle':       len(idle_trucks),
-            'candidates': len(top_candidates) if 'top_candidates' in locals() else '-',
-            'fill%':      f"{grid.fill_pct()*100:.3f}",
-            'pack%':      f"{grid.pack_pct()*100:.3f}",
-        }
-        renderer.draw(trucks, metrics)
+            metrics = {
+                'tick':       tick,
+                'fleet':      f"{FLEET_COMPOSITION['small']}S/{FLEET_COMPOSITION['medium']}M/{FLEET_COMPOSITION['large']}L",
+                'idle':       len([t for t in trucks if t.is_idle()]),
+                'candidates': len(top_candidates) if 'top_candidates' in locals() else '-',
+                'fill%':      f"{grid.fill_pct()*100:.3f}",
+                'pack%':      f"{grid.pack_pct()*100:.3f}",
+            }
+            renderer.draw(trucks, metrics)
 
-        time.sleep(TICK_DELAY)
-        tick += 1
-
+            time.sleep(TICK_DELAY)
+            tick += 1
     print("\n=== Final Results ===")
     print(f"Total ticks:   {tick}")
     print(f"Fill %:        {grid.fill_pct()*100:.3f}%")

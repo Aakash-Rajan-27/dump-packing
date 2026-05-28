@@ -102,6 +102,23 @@ class Truck:
         self._dump_ticks = 0                 # tick counter for the current dump operation
         self._exit_path  = []                # waypoints for the return trip to the entry point
 
+    def _waypoint_to_pose(self, grid, waypoint):
+        if len(waypoint) == 3:
+            return waypoint
+
+        r, c = waypoint
+        tx, ty = grid.cell_to_world(r, c)
+        dx, dy = tx - self.pos[0], ty - self.pos[1]
+        heading = self.heading
+        if abs(dx) > 0.01 or abs(dy) > 0.01:
+            heading = np.arctan2(dy, dx)
+        return tx, ty, heading
+
+    def _waypoint_to_cell(self, grid, waypoint):
+        if len(waypoint) == 3:
+            return grid.world_to_cell(waypoint[0], waypoint[1])
+        return waypoint
+
     def set_path(self, path, dump_target, grid):
         self.path        = list(path)   # copy the path so mutations outside don't affect us
         self.dump_target = dump_target  # remember which cell we're filling this trip
@@ -138,17 +155,17 @@ class Truck:
 
         elif self.status == self.STATUS_NAVIGATING:
             if self.path:
-                r, c = self.path.pop(0)               # consume the next waypoint from the front of the list
-                tx, ty = grid.cell_to_world(r, c)     # convert grid cell to world-space (x, y) coordinates
-                dx, dy = tx - self.pos[0], ty - self.pos[1]  # vector from current position to next waypoint
-                if abs(dx) > 0.01 or abs(dy) > 0.01:  # skip heading update if essentially already there (avoids atan2(0,0))
-                    self.heading = np.arctan2(dy, dx)  # point the truck toward the next waypoint
+                waypoint = self.path.pop(0)           # consume the next waypoint from the front of the list
+                tx, ty, heading = self._waypoint_to_pose(grid, waypoint)
                 self.pos[0], self.pos[1] = tx, ty     # snap position to the waypoint (no interpolation between ticks)
+                self.heading = heading
+                r, c = grid.world_to_cell(tx, ty)
                 grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
 
             if not self.path:  # path just ran out — check whether we reached the intended stop
                 tr, tc = grid.world_to_cell(*self.pos)  # convert current world pos back to grid cell
-                if self.stop_target and (tr, tc) == self.stop_target:  # did we land exactly on the stop cell?
+                stop_cell = self._waypoint_to_cell(grid, self.stop_target) if self.stop_target else None
+                if stop_cell and (tr, tc) == stop_cell:  # did we land exactly on the stop cell?
                     if self.dump_target:
                         dr, dc = self.dump_target
                         dtx, dty = grid.cell_to_world(dr, dc)
@@ -178,17 +195,15 @@ class Truck:
 
         elif self.status == self.STATUS_EXITING:
             if self._exit_path:
-                r, c = self._exit_path.pop(0)          # consume the next exit waypoint
-                tx, ty = grid.cell_to_world(r, c)      # convert to world coords
-                dx, dy = tx - self.pos[0], ty - self.pos[1]
-                if abs(dx) > 0.01 or abs(dy) > 0.01:
-                    self.heading = np.arctan2(dy, dx)
+                waypoint = self._exit_path.pop(0)      # consume the next exit waypoint
+                tx, ty, heading = self._waypoint_to_pose(grid, waypoint)
                 self.pos[0], self.pos[1] = tx, ty
+                self.heading = heading
+                r, c = grid.world_to_cell(tx, ty)
                 grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
 
                 if not self._exit_path:                # just consumed the last waypoint — path complete
                     self.pos         = list(ENTRY_POINT)
-                    self.heading     = np.pi / 2
                     self.status      = self.STATUS_IDLE
                     self.path        = []
                     self.dump_target = None
