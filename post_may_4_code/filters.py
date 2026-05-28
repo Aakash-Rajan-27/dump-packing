@@ -36,7 +36,7 @@ import numpy as np
 from collections import deque
 import shapely
 from grid_map import CellState
-from config import CELL_SIZE, ENTRY_POINT, DRIVE_CLEARANCE_M
+from config import CELL_SIZE, ENTRY_POINT, DRIVE_CLEARANCE_M, TARGET_PILE_HEIGHT
 
 _BLOCKED = (CellState.BOUNDARY, CellState.FILLED, CellState.OBSTACLE)
 _BRIDGE_RISK_BLOCKED = (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE)
@@ -105,55 +105,49 @@ def make_driveable_mask(grid, truck):
     half_l  = truck.length / 2.0
     offsets = _build_corner_offsets(half_w, half_l)
 
-    rows, cols = grid.rows, grid.cols
-    mask = np.zeros((rows, cols, 8), dtype=bool)
-    
-    # ─── THE FORGIVENESS BUFFER ───
-    max_escape_height = DRIVE_CLEARANCE_M + 0.5
+    rows, cols        = grid.rows, grid.cols
+    mask              = np.zeros((rows, cols, 8), dtype=bool)
+    max_escape_height = DRIVE_CLEARANCE_M + 0.5  # forgiveness buffer so trucks can escape shallow pile edges
 
-    base_ok = np.zeros((rows, cols), dtype=bool)
-    for r in range(rows):
-        for c in range(cols):
-            s = grid.state[r, c]
-            
-            if s in _BLOCKED:
-                continue
-                
-            if grid.z_height[r, c] > max_escape_height:
-                continue
-                
-            base_ok[r, c] = True
+    # ── VECTORIZED base_ok ───────────────────────────────────────────────────────
+    # Was: Python double loop (8100 iterations calling per-cell checks).
+    # Now: two numpy boolean masks combined in one expression — ~100× faster.
+    base_ok = (~np.isin(grid.state, list(_BLOCKED))) & (grid.z_height <= max_escape_height)
 
-    candidate_cells = list(zip(*np.where(base_ok)))
-    if not candidate_cells:
+    rows_arr, cols_arr = np.where(base_ok)  # row/col indices of all passable cells as flat arrays
+    if len(rows_arr) == 0:
         return mask
 
-    centres = np.array([grid.cell_to_world(r, c) for r, c in candidate_cells])
-    N = len(centres)
-    ex, ey = ENTRY_POINT
+    # ── VECTORIZED centre computation ────────────────────────────────────────────
+    # Was: list comprehension calling cell_to_world() ~8100 times then np.array() conversion.
+    # Now: direct vectorised arithmetic on the index arrays — same result, no Python loop.
+    ex, ey     = ENTRY_POINT
+    centres_x  = grid.origin[0] + cols_arr * grid.cell_size + grid.cell_size / 2
+    centres_y  = grid.origin[1] + rows_arr * grid.cell_size + grid.cell_size / 2
 
     for hi in range(8):
-        heading_fits = np.ones(N, dtype=bool)
+        heading_fits = np.ones(len(rows_arr), dtype=bool)
         for ci in range(4):
-            dx, dy   = offsets[hi, ci]
-            corner_x = centres[:, 0] + dx
-            corner_y = centres[:, 1] + dy
+            dx, dy    = offsets[hi, ci]
+            corner_x  = centres_x + dx
+            corner_y  = centres_y + dy
 
             c_col = np.clip(((corner_x - grid.origin[0]) / grid.cell_size).astype(int), 0, cols - 1)
             c_row = np.clip(((corner_y - grid.origin[1]) / grid.cell_size).astype(int), 0, rows - 1)
-            
-            corner_state = grid.state[c_row, c_col]
-            corner_z     = grid.z_height[c_row, c_col]
+
+            corner_state  = grid.state[c_row, c_col]
+            corner_z      = grid.z_height[c_row, c_col]
             dist_to_entry = np.hypot(corner_x - ex, corner_y - ey)
-            
+
             is_blocked  = np.isin(corner_state, [CellState.FILLED, CellState.OBSTACLE]) | (corner_z > max_escape_height)
             is_boundary = (corner_state == CellState.BOUNDARY) & (dist_to_entry > 15.0)
-            
+
             heading_fits &= ~(is_blocked | is_boundary)
 
-        for i, (r, c) in enumerate(candidate_cells):
-            if heading_fits[i]:
-                mask[r, c, hi] = True
+        # ── VECTORIZED mask assignment ───────────────────────────────────────────
+        # Was: Python loop `for i, (r, c) in enumerate(candidate_cells)` (~64 800 iterations across 8 headings).
+        # Now: boolean fancy indexing — writes all valid cells for this heading in one C-level operation.
+        mask[rows_arr[heading_fits], cols_arr[heading_fits], hi] = True
 
     return mask
 
@@ -222,10 +216,13 @@ def is_accessible(grid, r, c, entry_rc, truck, precomputed_coarse_mask=None):
 def get_raw_candidates(grid, truck):
     stride = _CANDIDATE_STRIDE
 
-    dumpable = np.zeros((grid.rows, grid.cols), dtype=bool)
-    for r in range(grid.rows):
-        for c in range(grid.cols):
-            dumpable[r, c] = grid.is_dumpable(r, c)
+    # ── VECTORIZED dumpable ──────────────────────────────────────────────────────
+    # Was: Python double loop calling is_dumpable() on every cell (~8100 iterations).
+    # Now: one numpy boolean expression — mirrors is_dumpable() exactly but runs in C.
+    _not_dumpable_states = (CellState.BOUNDARY, CellState.PROTECTED,
+                            CellState.OBSTACLE, CellState.FILLED, CellState.RESERVED)
+    dumpable = (~np.isin(grid.state, list(_not_dumpable_states)) &
+                (grid.z_height < TARGET_PILE_HEIGHT))
 
     candidates = []
     for r0 in range(0, grid.rows, stride):

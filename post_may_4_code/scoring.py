@@ -29,15 +29,16 @@ def score_candidates(grid, candidate_idxs, state_override=None):
 
     filled_mask  = (current_state == CellState.FILLED)
     partial_mask = (current_state == CellState.PARTIAL)
+    reserved_mask = (current_state == CellState.RESERVED)
 
     # Score 1: Density — dump near existing material
-    has_material  = filled_mask | partial_mask
+    has_material  = filled_mask | partial_mask | reserved_mask
     dist_to_pile  = distance_transform_edt(~has_material) * grid.cell_size
     spread        = grid.cell_size * 2
     density_score = np.exp(-dist_to_pile / spread)
 
     # Score 2: Coverage — spread dumps across polygon
-    zone_fill      = uniform_filter(filled_mask.astype(float),
+    zone_fill      = uniform_filter(has_material.astype(float),
                                     size=SCORE_FILTER_SIZE)
     coverage_score = 1.0 - zone_fill
 

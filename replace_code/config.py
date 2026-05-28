@@ -85,9 +85,9 @@ W_DISTANCE = 1.0
 W_HEADING  = 0.4
 
 # ── Scoring Weights ────────────────────────────────────────
-WEIGHTS_EARLY  = [0.2, 0.3, 0.1, 0.2, 0.2]
-WEIGHTS_MID    = [0.3, 0.2, 0.2, 0.2, 0.1]
-WEIGHTS_LATE   = [0.4, 0.1, 0.3, 0.1, 0.1]
+WEIGHTS_EARLY  = [0, 100, 0, 10, 20, 40]  # fill < 30%: spread out
+WEIGHTS_MID    = [0, 100, 0, 10, 20, 40]   # fill 30–70%: balance
+WEIGHTS_LATE   = [0, 100, 0, 10, 20, 40]   # fill > 70%: pack tight
 
 # ── Simulation ─────────────────────────────────────────────
 TICK_DELAY     = 0.05   # seconds between rendered frames

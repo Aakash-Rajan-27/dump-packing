@@ -51,8 +51,8 @@ TRUCK_CLASSES = {
 
 FLEET_COMPOSITION = {
     'small':  2,
-    'medium': 2,
-    'large':  1,
+    'medium': 0,
+    'large':  0,
 }
 
 # ── Dump / Pile Physics ────────────────────────────────────
@@ -75,6 +75,10 @@ PHEROMONE_DECAY = 0.85
 # Spread sigma in CELL units — keep physical spread ~3m regardless of CELL_SIZE
 # At CELL_SIZE=1.0: sigma=3.0 cells = 3m. At CELL_SIZE=0.5: sigma=6.0 cells = 3m
 PHEROMONE_SPREAD_SIGMA = max(1.0, 3.0 / CELL_SIZE)
+# Trail deposit: how strongly a truck step suppresses pheromone at its cell (0–1).
+# Gaussian gradient falls off over TRAIL_RADIUS_M metres around the truck position.
+TRAIL_STRENGTH  = 0.5
+TRAIL_RADIUS_M  = 3.0
 
 # ── MCTS ───────────────────────────────────────────────────
 MCTS_SIMULATIONS = 200
@@ -85,7 +89,7 @@ W_DISTANCE = 1.0
 W_HEADING  = 0.4
 
 # EARLY PHASE: Massive priority (0.4) on Entry Distance to push trucks to the back.
-WEIGHTS_EARLY = (0.1, 0.2, 0.1, 0.1, 0.1, 0.0) 
+WEIGHTS_EARLY = (0, 0, 0, 30, 0, 0) 
 
 # MID PHASE: Focus shifts to clustering and filling gaps.
 WEIGHTS_MID   = (0.3, 0.2, 0.2, 0.1, 0.1, 0.1) 

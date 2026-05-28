@@ -26,7 +26,7 @@ from filters    import get_raw_candidates, is_accessible, precompute_coarse_bloc
 from scoring    import score_candidates
 from mcts       import mcts_select_dump_points
 from assignment import assign
-from pathfinder import plan_paths
+from pathfinder import plan_paths_cbs
 from renderer   import Renderer
 
 
@@ -68,7 +68,11 @@ def run_simulation():
         exiting_trucks = [t for t in trucks if t.needs_exit_path()]
         if exiting_trucks:
             exit_assignments = [(t, entry_rc) for t in exiting_trucks]
-            exit_paths = plan_paths(grid, exit_assignments)
+            # Pass the remaining paths of all currently navigating trucks as locked paths
+            # so the new exit routes don't cross through them.
+            nav_locked = {t.id: [grid.world_to_cell(*t.pos)] + list(t.path)
+                          for t in trucks if t.status == t.STATUS_NAVIGATING and t.path}
+            exit_paths = plan_paths_cbs(grid, exit_assignments, locked_paths=nav_locked)
             for t, _ in exit_assignments:
                 t.set_exit_path(exit_paths.get(t.id, []))
 
@@ -135,7 +139,18 @@ def run_simulation():
                     for t, _ in these_assignments:  remaining_idle.remove(t)
 
                 if assignments_all:
-                    paths = plan_paths(grid, assignments_all)
+                    # Pass remaining paths of all currently moving trucks (navigating + exiting)
+                    # so new dump paths never cross them.
+                    being_planned = {t for t, _ in assignments_all}
+                    all_locked = {}
+                    for t in trucks:
+                        if t in being_planned:
+                            continue  # this truck IS being planned — don't lock its old path
+                        if t.status == t.STATUS_NAVIGATING and t.path:
+                            all_locked[t.id] = [grid.world_to_cell(*t.pos)] + list(t.path)
+                        elif t.status == t.STATUS_EXITING and t._exit_path:
+                            all_locked[t.id] = [grid.world_to_cell(*t.pos)] + list(t._exit_path)
+                    paths = plan_paths_cbs(grid, assignments_all, locked_paths=all_locked)
                     for truck, dump_point in assignments_all:
                         truck_path = paths.get(truck.id, [])
                         truck.set_path(truck_path, dump_point, grid)

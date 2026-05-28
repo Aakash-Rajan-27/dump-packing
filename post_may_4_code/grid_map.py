@@ -190,6 +190,20 @@ class GridMap:
                 if self.z_height[i, j] > 0:
                     self.pheromone[i, j] = 0.0
 
+    def deposit_trail(self, r, c, radius_cells, strength):
+        rad = int(math.ceil(radius_cells))
+        r_min = max(0, r - rad);  r_max = min(self.rows, r + rad + 1)
+        c_min = max(0, c - rad);  c_max = min(self.cols, c + rad + 1)
+        rs = np.arange(r_min, r_max)
+        cs = np.arange(c_min, c_max)
+        rr, cc = np.meshgrid(rs, cs, indexing='ij')
+        dist2  = (rr - r) ** 2 + (cc - c) ** 2
+        sigma2 = max(1.0, radius_cells / 2.0) ** 2
+        drop   = strength * np.exp(-dist2 / (2.0 * sigma2)).astype(np.float32)
+        self.pheromone[r_min:r_max, c_min:c_max] = np.maximum(
+            0.0, self.pheromone[r_min:r_max, c_min:c_max] - drop
+        )
+
     def _update_state(self, r, c):
         if self.state[r, c] in (CellState.BOUNDARY, CellState.PROTECTED, CellState.OBSTACLE, CellState.RESERVED):
             return
@@ -212,6 +226,7 @@ class GridMap:
 
     def is_dumpable(self, r, c):
         if self.state[r, c] in (CellState.BOUNDARY, CellState.PROTECTED,
-                                 CellState.OBSTACLE, CellState.FILLED):
+                                 CellState.OBSTACLE, CellState.FILLED,
+                                 CellState.RESERVED):  # RESERVED = already claimed by a navigating truck; exclude so two trucks never get the same target
             return False
         return self.z_height[r, c] < TARGET_PILE_HEIGHT

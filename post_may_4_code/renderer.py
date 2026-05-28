@@ -93,7 +93,7 @@ class Renderer:
     def _draw_grid(self):
         # THE FIX: Wipe the canvas clean every frame to stop ghost trails
         self.grid_surface.fill((0, 0, 0))
-        
+
         g = self.grid
         s = self.scale
 
@@ -105,20 +105,21 @@ class Renderer:
 
                 if state == CellState.BOUNDARY:
                     colour = CELL_COLOURS[CellState.BOUNDARY]
-
                 elif state in (CellState.PARTIAL, CellState.FILLED):
                     colour = _height_colour(z_norm[r, c])
-
-                elif state == CellState.EMPTY:
-                    # PHEROMONE LOGIC REVERTED TO ACTIVE
-                    ph    = g.pheromone[r, c]
-                    base  = CELL_COLOURS[CellState.EMPTY]
-                    r_val = min(255, int(base[0] + (1 - ph) * 50))
-                    g_val = max(0,   int(base[1] - (1 - ph) * 25))
-                    colour = (r_val, g_val, base[2])
-
                 else:
                     colour = CELL_COLOURS.get(state, (50, 50, 50))
+
+                # Pheromone trail tint: cyan-blue overlay, intensity = 1 - pheromone.
+                # Visible on all non-boundary cells; fades out as pheromone recovers to 1.
+                if state != CellState.BOUNDARY:
+                    trail = 1.0 - g.pheromone[r, c]
+                    if trail > 0.01:
+                        colour = (
+                            max(0,   int(colour[0] - trail * 40)),
+                            max(0,   int(colour[1] - trail * 20)),
+                            min(255, int(colour[2] + trail * 80)),
+                        )
 
                 pygame.draw.rect(
                     self.grid_surface, colour,
