@@ -53,6 +53,8 @@ def build_cost_matrix(trucks, dump_points, grid):
 
             C[i, j] = (W_DISTANCE * norm_dist +
                        W_HEADING * heading_scale * norm_heading)
+    print("Hungarian Cost Matrix (Distance + Heading):")
+    print(np.round(C, 2))
 
     return C
 

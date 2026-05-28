@@ -1,25 +1,22 @@
 # pathfinder.py
-# ─────────────────────────────────────────────────────────────
-# FIX: State explosion causing zero-length paths.
+# A* pathfinding for trucks on the dump grid.
 #
-# Old state: (r, c, prev_r, prev_c) — 4 values.
-# At 91x91 grid: 91^4 = 68M possible states.
-# A* with this state space runs out of memory/time for paths
-# longer than ~45 cells (e.g. entry at row 0 to goal at row 84).
-#
-# New state: (r, c) — 2 values.
-# State space: 91x91 = 8,281 cells. Always finds paths.
-# Turn cost preserved as a g-cost penalty: when the truck changes
-# direction, extra cost is added — this still steers A* toward
-# straighter paths without exploding the state space.
-#
-# All other logic (heading-aware mask, CBS) unchanged.
-# ─────────────────────────────────────────────────────────────
+# Key design decisions:
+#   - State is just (row, col) — 4-value states caused 68M-node explosions.
+#   - A RADIUS GOAL is used instead of an exact cell goal. The search stops
+#     once the truck is within stop_dist_cells of the target. This prevents
+#     failures when the exact target cell is inside a dirt pile (>0.4m height).
+#   - Other trucks' cells are treated as soft obstacles (high cost, not walls),
+#     so trucks can still re-route if another truck is blocking the only path.
 
 import heapq
 import numpy as np
+import math
 from filters import make_driveable_mask
+from config import DRIVE_CLEARANCE_M, _TAN_REPOSE, ENTRY_POINT
 
+# Maps a unit step direction (dr, dc) to one of 8 heading buckets.
+# Used to index into the driveable mask's heading dimension.
 _DIR_TO_BUCKET = {
     ( 0,  1): 0,
     (-1,  1): 1,
@@ -31,222 +28,138 @@ _DIR_TO_BUCKET = {
     ( 1,  1): 7,
 }
 
-
 def _heading_bucket(dr, dc):
     return _DIR_TO_BUCKET.get((dr, dc), 0)
 
-
 def _turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells):
     """
-    Extra cost when the truck changes direction.
-    prev_dr/dc: direction of last move. dr/dc: direction of this move.
-    A 90-degree change costs turn_radius_cells * 0.3.
-    Reduced from 0.5 to 0.3 so turn penalty doesn't overwhelm long paths.
+    Extra path cost for changing direction.
+    Straight ahead (dot product = 1) is free. Any turn adds a penalty
+    proportional to the truck's turning radius — tighter-turning trucks pay less.
     """
-    if prev_dr is None:
-        return 0.0
+    if prev_dr is None: return 0.0
     dot = prev_dr * dr + prev_dc * dc
     return 0.0 if dot == 1 else turn_radius_cells * 0.3
 
-
-def astar(driveable, grid, start_rc, goal_rc, truck, blocked_cells=frozenset()):
+def astar(driveable, grid, start_rc, goal_rc, truck, blocked_cells=frozenset(), stop_dist_cells=0.0):
     """
-    A* with (r,c) state — fixed from (r,c,pr,pc) to prevent state explosion.
+    A* search from start_rc toward goal_rc on a driveable mask.
 
-    Turn cost is still applied as a g-cost penalty so large trucks
-    prefer straighter routes, but the state space stays manageable.
+    driveable      : 3D boolean mask [rows, cols, 8 headings] from make_driveable_mask()
+    blocked_cells  : set of (r,c) occupied by other trucks — traversable but expensive
+    stop_dist_cells: stop searching once within this cell-radius of goal_rc (radius goal)
+
+    Returns a list of (row, col) cells from start (exclusive) to the stopping point.
+    Returns [] if no path exists.
     """
-    if start_rc == goal_rc:
-        return []
-
     turn_radius_cells = truck.turn_radius / grid.cell_size
     rows, cols        = driveable.shape[:2]
 
-    # State: (r, c). Track last direction separately for turn cost.
+    # Heap entries: (f_cost, g_cost, row, col, prev_dr, prev_dc)
     open_heap = [(0.0, 0.0, start_rc[0], start_rc[1], None, None)]
-    # heap entry: (f, g, r, c, prev_dr, prev_dc)
-
-    came_from = {}   # (r,c) → (pr, pc)
+    came_from = {}
     g_cost    = {start_rc: 0.0}
 
     while open_heap:
         f, g, r, c, prev_dr, prev_dc = heapq.heappop(open_heap)
 
-        if (r, c) == goal_rc:
-            # Reconstruct path
-            path = []
-            cur  = goal_rc
+        # Radius goal: accept any cell within stop_dist_cells of the target
+        dist_to_target = math.hypot(r - goal_rc[0], c - goal_rc[1])
+        if dist_to_target <= stop_dist_cells:
+            # Reconstruct path by walking came_from back to start
+            path, cur = [], (r, c)
             while cur in came_from:
                 path.append(cur)
                 cur = came_from[cur]
             path.reverse()
             return path
 
-        if g > g_cost.get((r, c), float('inf')):
-            continue
+        # Skip if a cheaper route to this cell was already found
+        if g > g_cost.get((r, c), float('inf')): continue
 
+        # Only expand cardinal directions (no diagonals) to keep paths grid-aligned
         for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
             nr, nc = r + dr, c + dc
-            if not (0 <= nr < rows and 0 <= nc < cols):
-                continue
+            if not (0 <= nr < rows and 0 <= nc < cols): continue
 
-            if (nr, nc) != goal_rc:
-                hb = _heading_bucket(dr, dc)
-                if not driveable[nr, nc, hb]:
-                    continue
-                if (nr, nc) in blocked_cells:
-                    continue
+            # Check driveable mask for this cell+heading combination
+            hb = _heading_bucket(dr, dc)
+            if not driveable[nr, nc, hb]: continue
 
-            tc    = _turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells)
-            new_g = g + 1.0 + tc
+            # Soft penalty for cells occupied by other trucks (avoids but doesn't block)
+            traffic_cost = 10.0 if (nr, nc) in blocked_cells else 0.0
+            tc = _turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells)
+            new_g = g + 1.0 + tc + traffic_cost
 
             if new_g < g_cost.get((nr, nc), float('inf')):
                 g_cost[(nr, nc)] = new_g
-                h = abs(nr - goal_rc[0]) + abs(nc - goal_rc[1])
-                heapq.heappush(open_heap,
-                               (new_g + h, new_g, nr, nc, dr, dc))
+                h = abs(nr - goal_rc[0]) + abs(nc - goal_rc[1])  # Manhattan heuristic
+                heapq.heappush(open_heap, (new_g + h, new_g, nr, nc, dr, dc))
                 came_from[(nr, nc)] = (r, c)
 
-    return []
+    return []  # no path found
 
-
-def plan_paths(grid, assignments):
+def plan_paths(grid, assignments, existing_paths=None):
     """
-    Each truck class gets its own heading-aware driveable mask.
-    Mask cached by truck_class — same class = same dimensions = same mask.
-    Reduces mask computation from 9 calls to 3 (one per class).
+    Plan paths for a list of (truck, target_rc) assignments.
+
+    Trucks are planned sequentially. After each truck's path is found, its
+    first cell is added to current_truck_cells so the next truck treats it
+    as a soft obstacle. This reduces (but doesn't eliminate) overlap.
+
+    Returns a dict: {truck_id: [(r,c), ...]}
     """
-    if not assignments:
-        return {}
+    if not assignments: return {}
 
-    all_truck_cells = {
-        grid.world_to_cell(*truck.pos)
-        for truck, _ in assignments
-    }
+    # Seed the occupied-cell set with all trucks' current positions and path heads
+    current_truck_cells = set()
+    if existing_paths is not None:
+        for p in existing_paths.values():
+            if p: current_truck_cells.add(p[0])
 
-    # Cache mask by truck class — all trucks of same class share mask
-    mask_cache = {}
+    for truck, _ in assignments:
+        current_truck_cells.add(grid.world_to_cell(*truck.pos))
 
-    paths = {}
-    for truck, dump_point in assignments:
+    mask_cache, paths = {}, {}
+    entry_rc = grid.world_to_cell(*ENTRY_POINT)
+
+    for truck, target_rc in assignments:
+        # Build (and cache) the driveable mask once per truck class, not per truck
         if truck.truck_class not in mask_cache:
             mask_cache[truck.truck_class] = make_driveable_mask(grid, truck)
+
         driveable  = mask_cache[truck.truck_class]
         truck_cell = grid.world_to_cell(*truck.pos)
-        obstacles  = all_truck_cells - {truck_cell}
-        paths[truck.id] = astar(driveable, grid, truck_cell,
-                                dump_point, truck,
-                                blocked_cells=obstacles)
+        obstacles  = current_truck_cells - {truck_cell}  # don't block yourself
+
+        # Calculate how far short of the target the truck should stop.
+        # For the entry gate: use a fixed 2m radius so minor offsets don't cause failures.
+        # For dump cells: use the pile's safe clearance radius so the truck doesn't
+        #   park on top of the pile it just created (which would trap it in a high-terrain cell).
+        if target_rc == entry_rc:
+            stop_dist_cells = 2.0 / grid.cell_size
+        else:
+            # r_pile_m: radius where the sandpile drops to DRIVE_CLEARANCE_M height
+            r_pile_m = (3 * truck.payload_volume_m3 / (math.pi * _TAN_REPOSE)) ** (1/3)
+            d_clearance = max(0.0, r_pile_m - (DRIVE_CLEARANCE_M / _TAN_REPOSE))
+            safe_dist_m = d_clearance + (truck.length / 2.0)
+            stop_dist_cells = safe_dist_m / grid.cell_size
+
+        path = astar(driveable, grid, truck_cell, target_rc, truck,
+                     blocked_cells=obstacles, stop_dist_cells=stop_dist_cells)
+
+        paths[truck.id] = path
+        # Register this truck's first step so subsequent trucks avoid it
+        if path:
+            current_truck_cells.add(path[0])
+
+        print(f"DEBUG: Truck {truck.id} ({truck.truck_class}) Target: {target_rc} Path: {path} StopDistCells: {stop_dist_cells:.2f}")
+        
     return paths
 
-
-# ── WEEK 2: CBS ────────────────────────────────────────────
-
 def plan_paths_cbs(grid, assignments):
-    """CBS with simplified (r,c,t) state space."""
-
-    def astar_constrained(start, goal, truck, constraints):
-        driveable = make_driveable_mask(grid, truck)
-        rows, cols = driveable.shape[:2]
-        turn_radius_cells = truck.turn_radius / grid.cell_size
-
-        open_heap = [(0.0, 0.0, start[0], start[1], 0, None, None)]
-        came_from = {}
-        g_cost    = {(start[0], start[1], 0): 0.0}
-
-        while open_heap:
-            f, g, r, c, t, prev_dr, prev_dc = heapq.heappop(open_heap)
-
-            if (r, c) == goal:
-                path, cur = [], (r, c, t)
-                while cur in came_from:
-                    path.append((cur[0], cur[1]))
-                    cur = came_from[cur]
-                path.reverse()
-                return path
-
-            if g > g_cost.get((r, c, t), float('inf')):
-                continue
-
-            for dr, dc in ((-1,0),(1,0),(0,-1),(0,1),(0,0)):
-                nr, nc, nt = r+dr, c+dc, t+1
-                if not (0 <= nr < rows and 0 <= nc < cols):
-                    continue
-                if (nr, nc) != goal and (dr, dc) != (0, 0):
-                    hb = _heading_bucket(dr, dc)
-                    if not driveable[nr, nc, hb]:
-                        continue
-                if (nr, nc, nt) in constraints:
-                    continue
-
-                tc    = (_turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells)
-                         if (dr, dc) != (0, 0) else 0.0)
-                new_g = g + 1.0 + tc
-                key   = (nr, nc, nt)
-
-                if new_g < g_cost.get(key, float('inf')):
-                    g_cost[key] = new_g
-                    h = abs(nr-goal[0]) + abs(nc-goal[1])
-                    heapq.heappush(open_heap,
-                                   (new_g+h, new_g, nr, nc, nt, dr, dc))
-                    came_from[key] = (r, c, t)
-
-        return []
-
-    def find_conflict(paths):
-        ids = list(paths.keys())
-        for i in range(len(ids)):
-            for j in range(i+1, len(ids)):
-                pa, pb = paths[ids[i]], paths[ids[j]]
-                for t in range(max(len(pa), len(pb))):
-                    a = pa[t] if t < len(pa) else (pa[-1] if pa else None)
-                    b = pb[t] if t < len(pb) else (pb[-1] if pb else None)
-                    if a and b and a == b:
-                        return (ids[i], ids[j], a[0], a[1], t)
-        return None
-
-    truck_list = [truck for truck, _ in assignments]
-    goal_map   = {truck.id: dp    for truck, dp in assignments}
-    truck_map  = {truck.id: truck for truck, _  in assignments}
-
-    init_paths = {
-        truck.id: astar_constrained(
-            grid.world_to_cell(*truck.pos),
-            goal_map[truck.id], truck, set()
-        )
-        for truck in truck_list
-    }
-    init_constraints = {truck.id: set() for truck in truck_list}
-    init_cost        = sum(len(p) for p in init_paths.values())
-
-    node_id  = 0
-    cbs_heap = [(init_cost, node_id, init_constraints, init_paths)]
-    node_id += 1
-
-    for _ in range(500):
-        if not cbs_heap:
-            break
-        cost, _, constraints, paths = heapq.heappop(cbs_heap)
-        conflict = find_conflict(paths)
-        if conflict is None:
-            return paths
-
-        id_a, id_b, r, c, t = conflict
-        for blocked_id in (id_a, id_b):
-            new_constraints = {tid: set(s) for tid, s in constraints.items()}
-            new_constraints[blocked_id].add((r, c, t))
-            truck_obj = truck_map[blocked_id]
-            new_path  = astar_constrained(
-                grid.world_to_cell(*truck_obj.pos),
-                goal_map[blocked_id], truck_obj,
-                new_constraints[blocked_id]
-            )
-            new_paths             = dict(paths)
-            new_paths[blocked_id] = new_path
-            new_cost              = sum(len(p) for p in new_paths.values())
-            heapq.heappush(cbs_heap,
-                           (new_cost, node_id, new_constraints, new_paths))
-            node_id += 1
-
-    print("CBS did not converge — falling back to independent A*")
+    """
+    Placeholder for Conflict-Based Search multi-agent pathfinding.
+    Currently just delegates to plan_paths (sequential A*).
+    """
     return plan_paths(grid, assignments)
