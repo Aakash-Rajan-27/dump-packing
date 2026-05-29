@@ -177,7 +177,7 @@ class GridMap:
                         dz = self.z_height[i, j] - self.z_height[ni, nj]
                         if dz > max_dz:
                             transfer = (dz - max_dz) / 2.0
-                            
+                            #here it doesnt actually check what the maximum dz is globally, 
                             # THE ANTI-FREEZE FIX: Ignore microscopic dirt movements
                             if transfer > 0.005: 
                                 self.z_height[i, j]   -= transfer
@@ -189,6 +189,8 @@ class GridMap:
                 self._update_state(i, j)
                 if self.z_height[i, j] > 0:
                     self.pheromone[i, j] = 0.0
+                    # interesting, so every cell gets pheromone 0 
+                
 
     def deposit_trail(self, r, c, radius_cells, strength):
         rad = int(math.ceil(radius_cells))
