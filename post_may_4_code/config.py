@@ -109,5 +109,5 @@ TICK_DELAY     = 0.05   # seconds between rendered frames
 # Each step moves one cell (1m at CELL_SIZE=1.0). At STEPS_PER_TICK=3,
 # trucks move 3m per frame which is clearly visible on screen.
 # Increase to 5-8 for faster animation.
-STEPS_PER_TICK = 5
+STEPS_PER_TICK = 2
 PYGAME_SCALE   = None   # auto-computed in renderer
