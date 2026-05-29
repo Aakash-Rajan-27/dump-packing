@@ -70,7 +70,7 @@ def run_simulation():
             exit_assignments = [(t, entry_rc) for t in exiting_trucks]
             # Pass the remaining paths of all currently navigating trucks as locked paths
             # so the new exit routes don't cross through them.
-            nav_locked = {t.id: [grid.world_to_cell(*t.pos)] + list(t.path)
+            nav_locked = {t.id: [t.front_center_cell(grid)] + list(t.path)
                           for t in trucks if t.status == t.STATUS_NAVIGATING and t.path}
             exit_paths = plan_paths_cbs(grid, exit_assignments, locked_paths=nav_locked)
             for t, _ in exit_assignments:
@@ -147,9 +147,9 @@ def run_simulation():
                         if t in being_planned:
                             continue  # this truck IS being planned — don't lock its old path
                         if t.status == t.STATUS_NAVIGATING and t.path:
-                            all_locked[t.id] = [grid.world_to_cell(*t.pos)] + list(t.path)
+                            all_locked[t.id] = [t.front_center_cell(grid)] + list(t.path)
                         elif t.status == t.STATUS_EXITING and t._exit_path:
-                            all_locked[t.id] = [grid.world_to_cell(*t.pos)] + list(t._exit_path)
+                            all_locked[t.id] = [t.front_center_cell(grid)] + list(t._exit_path)
                     paths = plan_paths_cbs(grid, assignments_all, locked_paths=all_locked)
                     for truck, dump_point in assignments_all:
                         truck_path = paths.get(truck.id, [])
@@ -158,7 +158,8 @@ def run_simulation():
         # Movement / render phase. Draw every fine truck step; batching several
         # steps before drawing hides the interpolated arc and makes turns look
         # like stop-rotate-go.
-        for _ in range(STEPS_PER_TICK):
+        substep_delay = TICK_DELAY / max(1, STEPS_PER_TICK)
+        for substep in range(STEPS_PER_TICK):
             if renderer.check_quit():
                 done = True
                 break
@@ -171,7 +172,7 @@ def run_simulation():
             np.clip(grid.pheromone, 0.0, 1.0, out=grid.pheromone)
 
             metrics = {
-                'tick':       tick,
+                'tick':       f"{tick}.{substep + 1}/{STEPS_PER_TICK}",
                 'fleet':      f"{FLEET_COMPOSITION['small']}S/{FLEET_COMPOSITION['medium']}M/{FLEET_COMPOSITION['large']}L",
                 'idle':       len([t for t in trucks if t.is_idle()]),
                 'candidates': len(top_candidates) if 'top_candidates' in locals() else '-',
@@ -180,8 +181,9 @@ def run_simulation():
             }
             renderer.draw(trucks, metrics)
 
-            time.sleep(TICK_DELAY)
-            tick += 1
+            time.sleep(substep_delay)
+
+        tick += 1
     print("\n=== Final Results ===")
     print(f"Total ticks:   {tick}")
     print(f"Fill %:        {grid.fill_pct()*100:.3f}%")

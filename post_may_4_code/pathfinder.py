@@ -74,6 +74,21 @@ def _path_cells(grid, path):
             cells.append((wp[0], wp[1]))
     return cells
 
+def _truck_front_cell(grid, truck):
+    if hasattr(truck, "front_center_cell"):
+        return truck.front_center_cell(grid)
+    front_x = truck.pos[0] + math.cos(truck.heading) * (truck.length / 2.0)
+    front_y = truck.pos[1] + math.sin(truck.heading) * (truck.length / 2.0)
+    return grid.world_to_cell(front_x, front_y)
+
+def _truck_front_pose(truck):
+    if hasattr(truck, "front_center_world"):
+        front_x, front_y = truck.front_center_world()
+    else:
+        front_x = truck.pos[0] + math.cos(truck.heading) * (truck.length / 2.0)
+        front_y = truck.pos[1] + math.sin(truck.heading) * (truck.length / 2.0)
+    return float(front_x), float(front_y), float(truck.heading)
+
 def _coarse_state_to_pose(grid, state):
     r, c = state[0], state[1]
     x, y = grid.cell_to_world(r, c)
@@ -115,7 +130,7 @@ def interpolate_path_to_truck_states(grid, truck, coarse_path):
     if getattr(truck, 'turn_radius', 0.0) < MIN_TURN_RADIUS_M:
         return []
 
-    states = [(float(truck.pos[0]), float(truck.pos[1]), float(truck.heading))]
+    states = [_truck_front_pose(truck)]
     for coarse_state in coarse_path:
         tx, ty, target_heading = _coarse_state_to_pose(grid, coarse_state)
         x, y, heading = states[-1]
@@ -204,7 +219,7 @@ def plan_paths(grid, assignments, existing_paths=None):
              if cells: current_truck_cells.add(cells[0])  # treat the front of each existing path as a "soft block"
 
     for truck, _ in assignments:
-         current_truck_cells.add(grid.world_to_cell(*truck.pos))  # add each truck's current cell
+         current_truck_cells.add(_truck_front_cell(grid, truck))  # add each truck's current front-centre cell
 
     mask_cache, paths = {}, {}  # cache driveable masks per truck class (expensive to recompute)
     entry_rc = grid.world_to_cell(*ENTRY_POINT)  # precompute the entry gate cell once
@@ -214,7 +229,7 @@ def plan_paths(grid, assignments, existing_paths=None):
             mask_cache[truck.truck_class] = make_driveable_mask(grid, truck)  # build (and cache) terrain mask for this truck type
 
         driveable  = mask_cache[truck.truck_class]        # the [row, col, bucket] boolean mask for this truck
-        truck_cell = grid.world_to_cell(*truck.pos)       # current cell of the truck
+        truck_cell = _truck_front_cell(grid, truck)       # current front-centre cell of the truck
         obstacles  = current_truck_cells - {truck_cell}   # other trucks' cells (this truck excluded)
 
         # ─── BULLDOZER MODE: FORCE START CELL TO BE VALID ───
@@ -231,7 +246,7 @@ def plan_paths(grid, assignments, existing_paths=None):
             # Safe distance for dumping to avoid "Inside Obstacle" failures
             r_pile_m = (1.2* truck.payload_volume_m3 / (math.pi * _TAN_REPOSE)) ** (1/3)  # radius where sandpile height equals the repose limit
             d_clearance = max(0.0, r_pile_m - (DRIVE_CLEARANCE_M / _TAN_REPOSE))           # extra clearance so the pile never buries the truck
-            safe_dist_m = d_clearance + (truck.length / 2.0)                               # add half the truck length so the rear stays outside the pile
+            safe_dist_m = d_clearance + truck.length/2                                       # front centre is one full truck length ahead of the rear
             stop_dist_cells = safe_dist_m / grid.cell_size                                  # convert metres to cells
 
         # GHOST MODE ACTIVATED: We pass frozenset() so it ignores 'obstacles' entirely
@@ -449,7 +464,7 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         if truck.truck_class not in mask_cache:
             mask_cache[truck.truck_class] = make_driveable_mask(grid, truck)  # build terrain passability mask
         driveable  = mask_cache[truck.truck_class]
-        truck_cell = grid.world_to_cell(*truck.pos)
+        truck_cell = _truck_front_cell(grid, truck)
 
         # Extended bulldozer: force start cell + 2-cell Manhattan radius driveable.
         # After dumping, the pile spreads 1-2 cells and blocks immediate neighbours —
@@ -467,7 +482,7 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         else:
             r_pile_m        = (1.2 * truck.payload_volume_m3 / (math.pi * _TAN_REPOSE)) ** (1 / 3)
             d_clearance     = max(0.0, r_pile_m - (DRIVE_CLEARANCE_M / _TAN_REPOSE))
-            safe_dist_m     = d_clearance + (truck.length / 2.0)
+            safe_dist_m     = d_clearance + truck.length
             stop_dist_cells = safe_dist_m / grid.cell_size
 
         agent_info[truck.id] = {

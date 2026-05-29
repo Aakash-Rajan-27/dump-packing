@@ -102,17 +102,48 @@ class Truck:
         self._dump_ticks = 0                 # tick counter for the current dump operation
         self._exit_path  = []                # waypoints for the return trip to the entry point
 
+    def front_center_world(self):
+        half_len = self.length / 2.0
+        return (
+            self.pos[0] + math.cos(self.heading) * half_len,
+            self.pos[1] + math.sin(self.heading) * half_len,
+        )
+
+    def front_center_cell(self, grid):
+        return grid.world_to_cell(*self.front_center_world())
+
+    def _body_pose_for_front_target(self, front_x, front_y):
+        half_len = self.length / 2.0
+        hx, hy = math.cos(self.heading), math.sin(self.heading)
+
+        dx = front_x - self.pos[0]
+        dy = front_y - self.pos[1]
+        forward = dx * hx + dy * hy
+        dist2 = dx * dx + dy * dy
+        lateral2 = max(0.0, dist2 - forward * forward)
+
+        if lateral2 <= half_len * half_len:
+            along_offset = math.sqrt(max(0.0, half_len * half_len - lateral2))
+            candidates = [forward - along_offset, forward + along_offset]
+            forward_candidates = [s for s in candidates if s >= -0.01]
+            travel = min(forward_candidates) if forward_candidates else max(candidates)
+            body_x = self.pos[0] + travel * hx
+            body_y = self.pos[1] + travel * hy
+        else:
+            heading_to_front = math.atan2(dy, dx)
+            body_x = front_x - math.cos(heading_to_front) * half_len
+            body_y = front_y - math.sin(heading_to_front) * half_len
+
+        new_heading = math.atan2(front_y - body_y, front_x - body_x)
+        return body_x, body_y, new_heading
+
     def _waypoint_to_pose(self, grid, waypoint):
         if len(waypoint) == 3:
-            return waypoint
+            return self._body_pose_for_front_target(waypoint[0], waypoint[1])
 
         r, c = waypoint
         tx, ty = grid.cell_to_world(r, c)
-        dx, dy = tx - self.pos[0], ty - self.pos[1]
-        heading = self.heading
-        if abs(dx) > 0.01 or abs(dy) > 0.01:
-            heading = np.arctan2(dy, dx)
-        return tx, ty, heading
+        return self._body_pose_for_front_target(tx, ty)
 
     def _waypoint_to_cell(self, grid, waypoint):
         if len(waypoint) == 3:
@@ -163,7 +194,7 @@ class Truck:
                 grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
 
             if not self.path:  # path just ran out — check whether we reached the intended stop
-                tr, tc = grid.world_to_cell(*self.pos)  # convert current world pos back to grid cell
+                tr, tc = self.front_center_cell(grid)  # path targets the truck's front centre, not its body centre
                 stop_cell = self._waypoint_to_cell(grid, self.stop_target) if self.stop_target else None
                 if stop_cell and (tr, tc) == stop_cell:  # did we land exactly on the stop cell?
                     if self.dump_target:
