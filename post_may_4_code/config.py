@@ -21,7 +21,7 @@ TRUCK_CLASSES = {
         'payload_t':              45.0,
         'width_m':                 5.5,
         'length_m':                8.7,
-        'turn_radius_m':          22.0,
+        'turn_radius_m':          5.0,
         'dump_ticks':                2,
         'pile_height_per_dump':    0.6,
         'colour':       (100, 220, 255),
@@ -61,10 +61,14 @@ ANGLE_OF_REPOSE    = 35.0
 DRIVE_CLEARANCE_M  = 0.1
 _TAN_REPOSE = math.tan(math.radians(ANGLE_OF_REPOSE))
 
-# Heading-aware truck state space. A* searches coarse grid poses
-# (row, col, heading); the returned route is densified for smooth rendering.
-TRUCK_INTERP_STEPS_PER_COARSE = 5
-MIN_TURN_RADIUS_M = 20.0
+# Rear-axle bicycle-model smoothing. A* still creates a normal coarse path.
+# The continuous pass then starts each turn early and clamps steering with
+# R = L / tan(delta), using each truck class's configured minimum radius.
+TURN_REFINEMENT_ITERATIONS = 5
+TRUCK_MOVE_STEP_M = 0.25
+TURN_LOOKAHEAD_RADIUS_FACTOR = 1.0
+TURN_PATH_TOLERANCE_M = 0.35
+TURN_MAX_SMOOTH_STEPS = 5000
 
 # ── Hybrid Accessibility Toggle ────────────────────────────
 # When fill_pct < this threshold, we score first, then BFS the top N.

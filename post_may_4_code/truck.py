@@ -112,6 +112,16 @@ class Truck:
     def front_center_cell(self, grid):
         return grid.world_to_cell(*self.front_center_world())
 
+    def rear_axle_world(self):
+        half_len = self.length / 2.0
+        return (
+            self.pos[0] - math.cos(self.heading) * half_len,
+            self.pos[1] - math.sin(self.heading) * half_len,
+        )
+
+    def front_axle_world(self):
+        return self.front_center_world()
+
     def _body_pose_for_front_target(self, front_x, front_y):
         half_len = self.length / 2.0
         hx, hy = math.cos(self.heading), math.sin(self.heading)
@@ -139,7 +149,13 @@ class Truck:
 
     def _waypoint_to_pose(self, grid, waypoint):
         if len(waypoint) == 3:
-            return self._body_pose_for_front_target(waypoint[0], waypoint[1])
+            rear_x, rear_y, heading = waypoint
+            half_len = self.length / 2.0
+            return (
+                rear_x + math.cos(heading) * half_len,
+                rear_y + math.sin(heading) * half_len,
+                heading,
+            )
 
         r, c = waypoint
         tx, ty = grid.cell_to_world(r, c)
@@ -147,7 +163,11 @@ class Truck:
 
     def _waypoint_to_cell(self, grid, waypoint):
         if len(waypoint) == 3:
-            return grid.world_to_cell(waypoint[0], waypoint[1])
+            rear_x, rear_y, heading = waypoint
+            return grid.world_to_cell(
+                rear_x + math.cos(heading) * self.length,
+                rear_y + math.sin(heading) * self.length,
+            )
         return waypoint
 
     def set_path(self, path, dump_target, grid):

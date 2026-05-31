@@ -14,7 +14,9 @@ import numpy as np  # array operations
 import math  # math.hypot for distance
 from filters import make_driveable_mask  # builds a 3-D boolean mask: [row, col, heading_bucket] → can drive here?
 from config import (DRIVE_CLEARANCE_M, _TAN_REPOSE, ENTRY_POINT,
-                    MIN_TURN_RADIUS_M, TRUCK_INTERP_STEPS_PER_COARSE)  # clearance, tan(angle), gate coords, turning controls
+                    TURN_REFINEMENT_ITERATIONS, TRUCK_MOVE_STEP_M,
+                    TURN_LOOKAHEAD_RADIUS_FACTOR, TURN_PATH_TOLERANCE_M,
+                    TURN_MAX_SMOOTH_STEPS)
 
 # Maps each of the 4 cardinal (row, col) step directions to an integer "bucket" index.
 # The driveable mask's third dimension is indexed by this bucket so we can have
@@ -81,64 +83,145 @@ def _truck_front_cell(grid, truck):
     front_y = truck.pos[1] + math.sin(truck.heading) * (truck.length / 2.0)
     return grid.world_to_cell(front_x, front_y)
 
-def _truck_front_pose(truck):
-    if hasattr(truck, "front_center_world"):
-        front_x, front_y = truck.front_center_world()
+def _truck_rear_pose(truck):
+    if hasattr(truck, "rear_axle_world"):
+        rear_x, rear_y = truck.rear_axle_world()
     else:
-        front_x = truck.pos[0] + math.cos(truck.heading) * (truck.length / 2.0)
-        front_y = truck.pos[1] + math.sin(truck.heading) * (truck.length / 2.0)
-    return float(front_x), float(front_y), float(truck.heading)
+        half_len = truck.length / 2.0
+        rear_x = truck.pos[0] - math.cos(truck.heading) * half_len
+        rear_y = truck.pos[1] - math.sin(truck.heading) * half_len
+    return float(rear_x), float(rear_y), float(truck.heading)
 
-def _coarse_state_to_pose(grid, state):
-    r, c = state[0], state[1]
-    x, y = grid.cell_to_world(r, c)
-    heading = state[2] if len(state) == 3 else 0.0
-    return x, y, heading
+def _truck_front_world(truck):
+    if hasattr(truck, "front_axle_world"):
+        return truck.front_axle_world()
+    return truck.front_center_world()
 
-def _hermite_pose(x0, y0, h0, x1, y1, h1, t):
-    dx = x1 - x0
-    dy = y1 - y0
-    dist = max(1e-9, math.hypot(dx, dy))
-    tangent_scale = dist * 0.5
+def _steering_angle(front, heading, target):
+    dx = target[0] - front[0]
+    dy = target[1] - front[1]
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return 0.0
+    return _angle_diff_signed(math.atan2(dy, dx), heading)
 
-    m0x = math.cos(h0) * tangent_scale
-    m0y = math.sin(h0) * tangent_scale
-    m1x = math.cos(h1) * tangent_scale
-    m1y = math.sin(h1) * tangent_scale
+def _turn_radius(length, steering_angle):
+    absolute_angle = abs(steering_angle)
+    if absolute_angle >= math.pi / 2:
+        return 0.0
+    tangent = math.tan(absolute_angle)
+    return float('inf') if tangent < 1e-9 else length / tangent
 
-    t2 = t * t
-    t3 = t2 * t
-    h00 = 2 * t3 - 3 * t2 + 1
-    h10 = t3 - 2 * t2 + t
-    h01 = -2 * t3 + 3 * t2
-    h11 = t3 - t2
+def _refine_front_target(front, heading, desired, truck):
+    """Clamp a front-wheel target with five generalized midpoint checks."""
+    steering = _steering_angle(front, heading, desired)
+    if _turn_radius(truck.length, steering) >= truck.turn_radius:
+        return desired, steering
 
-    x = h00 * x0 + h10 * m0x + h01 * x1 + h11 * m1x
-    y = h00 * y0 + h10 * m0y + h01 * y1 + h11 * m1y
+    distance = max(1e-9, math.hypot(desired[0] - front[0], desired[1] - front[1]))
+    feasible = (
+        front[0] + math.cos(heading) * distance,
+        front[1] + math.sin(heading) * distance,
+    )
+    infeasible = desired
+    for _ in range(TURN_REFINEMENT_ITERATIONS):
+        midpoint = (
+            (feasible[0] + infeasible[0]) / 2.0,
+            (feasible[1] + infeasible[1]) / 2.0,
+        )
+        midpoint_steering = _steering_angle(front, heading, midpoint)
+        if _turn_radius(truck.length, midpoint_steering) >= truck.turn_radius:
+            feasible = midpoint
+        else:
+            infeasible = midpoint
+    return feasible, _steering_angle(front, heading, feasible)
 
-    dh00 = 6 * t2 - 6 * t
-    dh10 = 3 * t2 - 4 * t + 1
-    dh01 = -6 * t2 + 6 * t
-    dh11 = 3 * t2 - 2 * t
-    vx = dh00 * x0 + dh10 * m0x + dh01 * x1 + dh11 * m1x
-    vy = dh00 * y0 + dh10 * m0y + dh01 * y1 + dh11 * m1y
+def _polyline_lengths(points):
+    lengths = [0.0]
+    for start, end in zip(points, points[1:]):
+        lengths.append(lengths[-1] + math.hypot(end[0] - start[0], end[1] - start[1]))
+    return lengths
 
-    heading = math.atan2(vy, vx) if abs(vx) > 1e-9 or abs(vy) > 1e-9 else h1
-    return x, y, heading
+def _sample_polyline(points, lengths, distance):
+    distance = max(0.0, min(distance, lengths[-1]))
+    for index in range(1, len(points)):
+        if lengths[index] >= distance:
+            segment = lengths[index] - lengths[index - 1]
+            if segment < 1e-9:
+                return points[index]
+            ratio = (distance - lengths[index - 1]) / segment
+            return (
+                points[index - 1][0] + ratio * (points[index][0] - points[index - 1][0]),
+                points[index - 1][1] + ratio * (points[index][1] - points[index - 1][1]),
+            )
+    return points[-1]
+
+def _closest_polyline_distance(points, lengths, point, start_distance):
+    best_distance = start_distance
+    best_error = float('inf')
+    for index in range(1, len(points)):
+        if lengths[index] + 1e-9 < start_distance:
+            continue
+        ax, ay = points[index - 1]
+        bx, by = points[index]
+        dx, dy = bx - ax, by - ay
+        segment2 = dx * dx + dy * dy
+        if segment2 < 1e-9:
+            continue
+        ratio = max(0.0, min(1.0, ((point[0] - ax) * dx + (point[1] - ay) * dy) / segment2))
+        px, py = ax + ratio * dx, ay + ratio * dy
+        error = math.hypot(point[0] - px, point[1] - py)
+        if error < best_error:
+            best_error = error
+            best_distance = lengths[index - 1] + ratio * math.sqrt(segment2)
+    return max(start_distance, best_distance)
 
 def interpolate_path_to_truck_states(grid, truck, coarse_path):
-    if getattr(truck, 'turn_radius', 0.0) < MIN_TURN_RADIUS_M:
+    """Emit rear-axle world poses that obey the configured minimum turn radius."""
+    if not coarse_path:
         return []
 
-    states = [_truck_front_pose(truck)]
-    for coarse_state in coarse_path:
-        tx, ty, target_heading = _coarse_state_to_pose(grid, coarse_state)
-        x, y, heading = states[-1]
-        for i in range(1, TRUCK_INTERP_STEPS_PER_COARSE + 1):
-            t = i / TRUCK_INTERP_STEPS_PER_COARSE
-            states.append(_hermite_pose(x, y, heading, tx, ty, target_heading, t))
+    points = [_truck_front_world(truck)]
+    for state in coarse_path:
+        point = grid.cell_to_world(state[0], state[1])
+        if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 1e-9:
+            points.append(point)
+    if len(points) == 1:
+        return []
 
-    return states[1:]
+    lengths = _polyline_lengths(points)
+    total_length = lengths[-1]
+    lookahead = max(TRUCK_MOVE_STEP_M, truck.turn_radius * TURN_LOOKAHEAD_RADIUS_FACTOR)
+    rear_x, rear_y, heading = _truck_rear_pose(truck)
+    progress = 0.0
+    states = []
+
+    # Looking ahead by roughly one minimum radius starts the physical turn
+    # before the coarse path corner and lets the rear axle converge afterward.
+    for _ in range(TURN_MAX_SMOOTH_STEPS):
+        front = (
+            rear_x + math.cos(heading) * truck.length,
+            rear_y + math.sin(heading) * truck.length,
+        )
+        progress = _closest_polyline_distance(points, lengths, front, progress)
+        remaining = math.hypot(points[-1][0] - front[0], points[-1][1] - front[1])
+        if progress >= total_length - 1e-9 and remaining <= TURN_PATH_TOLERANCE_M:
+            break
+
+        desired = _sample_polyline(points, lengths, progress + lookahead)
+        _, steering = _refine_front_target(front, heading, desired, truck)
+
+        # Rear wheels move along the current heading; the steering angle only
+        # changes heading through R = L / tan(delta).
+        rear_x += math.cos(heading) * TRUCK_MOVE_STEP_M
+        rear_y += math.sin(heading) * TRUCK_MOVE_STEP_M
+        heading += TRUCK_MOVE_STEP_M * math.tan(steering) / truck.length
+        heading = (heading + math.pi) % (2 * math.pi) - math.pi
+        states.append((rear_x, rear_y, heading))
+    else:
+        print(f"[PATHFINDER] Truck {truck.id} bicycle-model path did not converge")
+        return []
+
+    return states
 
 def _turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells):
     # Penalise direction changes to discourage zig-zag paths.
