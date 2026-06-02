@@ -26,7 +26,7 @@ from filters    import get_raw_candidates, is_accessible, precompute_coarse_bloc
 from scoring    import score_candidates
 from mcts       import mcts_select_dump_points
 from assignment import assign
-from pathfinder import plan_paths_cbs
+from pathfinder import plan_paths_cbs, plan_staging_paths
 from renderer   import Renderer
 
 
@@ -150,10 +150,11 @@ def run_simulation():
                             all_locked[t.id] = [t.front_center_cell(grid)] + list(t.path)
                         elif t.status == t.STATUS_EXITING and t._exit_path:
                             all_locked[t.id] = [t.front_center_cell(grid)] + list(t._exit_path)
-                    paths = plan_paths_cbs(grid, assignments_all, locked_paths=all_locked)
+                    paths, staging_poses = plan_staging_paths(grid, assignments_all, locked_paths=all_locked)
                     for truck, dump_point in assignments_all:
                         truck_path = paths.get(truck.id, [])
-                        truck.set_path(truck_path, dump_point, grid)
+                        truck.set_path(truck_path, dump_point, grid,
+                                       staging_pose=staging_poses.get(truck.id))
 
         # Movement / render phase. Draw every fine truck step; batching several
         # steps before drawing hides the interpolated arc and makes turns look

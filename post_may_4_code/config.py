@@ -21,7 +21,7 @@ TRUCK_CLASSES = {
         'payload_t':              45.0,
         'width_m':                 5.5,
         'length_m':                8.7,
-        'turn_radius_m':          5.0,
+        'turn_radius_m':          10.0,
         'dump_ticks':                2,
         'pile_height_per_dump':    0.6,
         'colour':       (100, 220, 255),
@@ -68,7 +68,19 @@ TURN_REFINEMENT_ITERATIONS = 5
 TRUCK_MOVE_STEP_M = 0.25
 TURN_LOOKAHEAD_RADIUS_FACTOR = 1.0
 TURN_PATH_TOLERANCE_M = 0.35
-TURN_MAX_SMOOTH_STEPS = 5000
+TURN_MAX_SMOOTH_STEPS = 5000 # safety cap to prevent infinite loops
+
+# Staging-pose planning. Trucks first drive forward to an outward-facing pose,
+# then reverse in a straight line until the rear is clear of the new pile.
+POSE_HEADING_BUCKETS = 24 # discrete headings for staging pose candidates (e.g. 24 = every 15 degrees)
+STAGING_NUM_ANGLES = 24 #
+STAGING_EXTRA_DISTANCE_M = 3.0 # Additional distance beyond the required dump clearance to encourage more spacious staging poses.
+STAGING_DISTANCE_WEIGHT = 0.10 
+STAGING_HEADING_WEIGHT = 1.0
+STAGING_FOOTPRINT_MARGIN_M = 0.0 
+REVERSE_DUMP_STEP_M = 0.5 # Step size for reverse maneuver. Smaller values yield smoother paths but require more iterations.
+REVERSE_DUMP_CLOSE_ENOUGH_M = 0.5 
+REVERSE_DUMP_HEADING_TOL_DEG = 10.0 # Trucks must be facing within this angle of the ideal heading to be considered "close enough" to the dump target during reverse maneuvers.
 
 # ── Hybrid Accessibility Toggle ────────────────────────────
 # When fill_pct < this threshold, we score first, then BFS the top N.
@@ -98,11 +110,11 @@ W_DISTANCE = 1.0
 W_HEADING  = 0.4
 
 # EARLY PHASE: Massive priority (0.4) on Entry Distance to push trucks to the back.
-WEIGHTS_EARLY = (0, 0, 0, 30, 0, 0) 
-#???
+WEIGHTS_EARLY = (0, 0, 0, 30, 0, 0)
 
 # MID PHASE: Focus shifts to clustering and filling gaps.
-WEIGHTS_MID   = (0.3, 0.2, 0.2, 0.1, 0.1, 0.1) 
+WEIGHTS_MID   = (0.3, 0.2, 0.2, 0.1, 0.1, 0.1) #the weights are 
+# respectively for: (distance, heading, fill_pct, pack_pct, entry_corridor, pheromone)
 
 # LATE PHASE: Pure focus on density and surface evenness. Distance doesn't matter anymore.
 WEIGHTS_LATE  = (0.5, 0.0, 0.3, 0.1, 0.1, 0.0)
@@ -113,5 +125,5 @@ TICK_DELAY     = 0.05   # seconds between rendered frames
 # Each step moves one cell (1m at CELL_SIZE=1.0). At STEPS_PER_TICK=3,
 # trucks move 3m per frame which is clearly visible on screen.
 # Increase to 5-8 for faster animation.
-STEPS_PER_TICK = 20
+STEPS_PER_TICK = 10
 PYGAME_SCALE   = None   # auto-computed in renderer

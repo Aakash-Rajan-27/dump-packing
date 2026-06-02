@@ -36,12 +36,17 @@ import numpy as np
 from collections import deque
 import shapely
 from grid_map import CellState
-from config import CELL_SIZE, ENTRY_POINT, DRIVE_CLEARANCE_M, TARGET_PILE_HEIGHT
+from config import (CELL_SIZE, ENTRY_POINT, DRIVE_CLEARANCE_M,
+                    TARGET_PILE_HEIGHT, POSE_HEADING_BUCKETS,
+                    STAGING_FOOTPRINT_MARGIN_M)
 
 _BLOCKED = (CellState.BOUNDARY, CellState.FILLED, CellState.OBSTACLE)
 _BRIDGE_RISK_BLOCKED = (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE)
 
-_HEADING_ANGLES = [i * np.pi / 4 for i in range(8)]
+_HEADING_ANGLES = [
+    i * 2 * np.pi / POSE_HEADING_BUCKETS
+    for i in range(POSE_HEADING_BUCKETS)
+]
 
 _COARSE_FACTOR = max(1, int(round(3.0 / CELL_SIZE)))
 _CANDIDATE_STRIDE = max(1, int(round(3.0 / CELL_SIZE)))
@@ -106,7 +111,7 @@ def make_driveable_mask(grid, truck):
     offsets = _build_corner_offsets(half_w, half_l)
 
     rows, cols        = grid.rows, grid.cols
-    mask              = np.zeros((rows, cols, 8), dtype=bool)
+    mask              = np.zeros((rows, cols, POSE_HEADING_BUCKETS), dtype=bool)
     max_escape_height = DRIVE_CLEARANCE_M + 0.5  # forgiveness buffer so trucks can escape shallow pile edges
 
     # ── VECTORIZED base_ok ───────────────────────────────────────────────────────
@@ -125,7 +130,7 @@ def make_driveable_mask(grid, truck):
     centres_x  = grid.origin[0] + cols_arr * grid.cell_size + grid.cell_size / 2
     centres_y  = grid.origin[1] + rows_arr * grid.cell_size + grid.cell_size / 2
 
-    for hi in range(8):
+    for hi in range(POSE_HEADING_BUCKETS):
         heading_fits = np.ones(len(rows_arr), dtype=bool)
         for ci in range(4):
             dx, dy    = offsets[hi, ci]
@@ -150,6 +155,28 @@ def make_driveable_mask(grid, truck):
         mask[rows_arr[heading_fits], cols_arr[heading_fits], hi] = True
 
     return mask
+
+
+def is_pose_driveable(grid, truck, x, y, heading, margin_m=None):
+    """Check the exact oriented truck rectangle at a continuous body pose."""
+    margin = STAGING_FOOTPRINT_MARGIN_M if margin_m is None else margin_m
+    half_w = truck.width / 2.0 + margin
+    half_l = truck.length / 2.0 + margin
+    hx, hy = np.cos(heading), np.sin(heading)
+    sx, sy = -hy, hx
+
+    for ls in (-1, 1):
+        for ws in (-1, 1):
+            corner_x = x + ls * half_l * hx + ws * half_w * sx
+            corner_y = y + ls * half_l * hy + ws * half_w * sy
+            if not shapely.contains_xy(grid.polygon, corner_x, corner_y):
+                return False
+            r, c = grid.world_to_cell(corner_x, corner_y)
+            if grid.state[r, c] in (CellState.FILLED, CellState.OBSTACLE):
+                return False
+            if grid.z_height[r, c] > DRIVE_CLEARANCE_M + 0.5:
+                return False
+    return True
 
 
 def precompute_coarse_blocked_mask(grid, truck):

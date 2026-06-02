@@ -12,11 +12,12 @@
 import heapq  # min-heap for A* open set (priority queue)
 import numpy as np  # array operations
 import math  # math.hypot for distance
-from filters import make_driveable_mask  # builds a 3-D boolean mask: [row, col, heading_bucket] → can drive here?
+from filters import is_pose_driveable, make_driveable_mask  # builds a 3-D boolean mask: [row, col, heading_bucket] → can drive here?
 from config import (DRIVE_CLEARANCE_M, _TAN_REPOSE, ENTRY_POINT,
                     TURN_REFINEMENT_ITERATIONS, TRUCK_MOVE_STEP_M,
                     TURN_LOOKAHEAD_RADIUS_FACTOR, TURN_PATH_TOLERANCE_M,
-                    TURN_MAX_SMOOTH_STEPS)
+                    TURN_MAX_SMOOTH_STEPS, POSE_HEADING_BUCKETS)
+from staging import score_staging_candidates
 
 # Maps each of the 4 cardinal (row, col) step directions to an integer "bucket" index.
 # The driveable mask's third dimension is indexed by this bucket so we can have
@@ -222,6 +223,147 @@ def interpolate_path_to_truck_states(grid, truck, coarse_path):
         return []
 
     return states
+
+
+def _pose_bucket(heading):
+    step = 2.0 * math.pi / POSE_HEADING_BUCKETS
+    return int(round(heading / step)) % POSE_HEADING_BUCKETS
+
+
+def _pose_heading(bucket):
+    return bucket * 2.0 * math.pi / POSE_HEADING_BUCKETS
+
+
+def _pose_allowed(grid, truck, x, y, heading):
+    # Trucks spawn partly outside the polygon at the loading gate.
+    if math.hypot(x - ENTRY_POINT[0], y - ENTRY_POINT[1]) <= 15.0:
+        return True
+    return is_pose_driveable(grid, truck, x, y, heading)
+
+
+def _hybrid_primitive(grid, truck, x, y, heading, turn):
+    """Generate one forward bicycle primitive and its intermediate body poses."""
+    heading_step = 2.0 * math.pi / POSE_HEADING_BUCKETS
+    travel = grid.cell_size if turn == 0 else max(grid.cell_size, truck.turn_radius * heading_step)
+    samples = max(1, int(math.ceil(travel / TRUCK_MOVE_STEP_M)))
+    ds = travel / samples
+    d_heading = 0.0 if turn == 0 else turn * heading_step / samples
+    poses = []
+
+    for _ in range(samples):
+        mid_heading = heading + d_heading / 2.0
+        x += math.cos(mid_heading) * ds
+        y += math.sin(mid_heading) * ds
+        heading = (heading + d_heading + math.pi) % (2.0 * math.pi) - math.pi
+        if not _pose_allowed(grid, truck, x, y, heading):
+            return None
+        poses.append((x, y, heading))
+    return poses
+
+
+def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset()):
+    """Plan forward bicycle arcs to an outward-facing staging pose."""
+    start_rc = grid.world_to_cell(*truck.pos)
+    start = (start_rc[0], start_rc[1], _pose_bucket(truck.heading))
+    open_heap = [(0.0, 0.0, start)]
+    g_cost = {start: 0.0}
+    came_from = {}
+    actions = {}
+    state_pose = {start: (truck.pos[0], truck.pos[1], truck.heading)}
+    terminal = None
+
+    while open_heap:
+        _, g, state = heapq.heappop(open_heap)
+        if g > g_cost.get(state, float('inf')):
+            continue
+        r, c, hb = state
+        x, y, heading = state_pose[state]
+
+        heading_error = abs(_angle_diff_signed(staging_pose.heading, heading))
+        if (math.hypot(x - staging_pose.x, y - staging_pose.y) <= 1.5 * grid.cell_size
+                and heading_error <= 2.0 * math.pi / POSE_HEADING_BUCKETS):
+            terminal = state
+            break
+
+        for turn in (-1, 0, 1):
+            primitive = _hybrid_primitive(grid, truck, x, y, heading, turn)
+            if not primitive:
+                continue
+            nx, ny, nh = primitive[-1]
+            nr, nc = grid.world_to_cell(nx, ny)
+            next_state = (nr, nc, _pose_bucket(nh))
+            if next_state == state:
+                continue
+            traffic_cost = 10.0 if (nr, nc) in blocked_cells else 0.0
+            new_g = g + len(primitive) * TRUCK_MOVE_STEP_M + traffic_cost
+            if new_g >= g_cost.get(next_state, float('inf')):
+                continue
+            g_cost[next_state] = new_g
+            came_from[next_state] = state
+            actions[next_state] = primitive
+            state_pose[next_state] = (nx, ny, nh)
+            h = math.hypot(nx - staging_pose.x, ny - staging_pose.y)
+            h += truck.turn_radius * abs(_angle_diff_signed(staging_pose.heading, nh))
+            heapq.heappush(open_heap, (new_g + h, new_g, next_state))
+
+    if terminal is None:
+        return []
+
+    segments = []
+    current = terminal
+    while current in came_from:
+        segments.append(actions[current])
+        current = came_from[current]
+    segments.reverse()
+
+    body_poses = [pose for segment in segments for pose in segment]
+    connector_start = body_poses[-1] if body_poses else state_pose[start]
+    dx = staging_pose.x - connector_start[0]
+    dy = staging_pose.y - connector_start[1]
+    distance = math.hypot(dx, dy)
+    connector_steps = max(1, int(math.ceil(distance / TRUCK_MOVE_STEP_M)))
+    heading_delta = _angle_diff_signed(staging_pose.heading, connector_start[2])
+    for index in range(1, connector_steps + 1):
+        ratio = index / connector_steps
+        x = connector_start[0] + ratio * dx
+        y = connector_start[1] + ratio * dy
+        heading = connector_start[2] + ratio * heading_delta
+        if not _pose_allowed(grid, truck, x, y, heading):
+            return []
+        body_poses.append((x, y, heading))
+    half_len = truck.length / 2.0
+    return [
+        (x - math.cos(heading) * half_len,
+         y - math.sin(heading) * half_len,
+         heading)
+        for x, y, heading in body_poses
+    ]
+
+
+def plan_staging_paths(grid, assignments, locked_paths=None):
+    """Try staging poses in score order and accept the first reachable one."""
+    blocked = set()
+    for path in (locked_paths or {}).values():
+        blocked.update(_path_cells(grid, path))
+
+    paths = {}
+    staging_poses = {}
+    for truck, dump_target in assignments:
+        paths[truck.id] = []
+        staging_poses[truck.id] = None
+        candidates = score_staging_candidates(grid, truck, dump_target)
+        print(f"[STAGING] Truck {truck.id}: {len(candidates)} valid candidates")
+        for candidate in candidates:
+            path = hybrid_astar_to_staging(grid, truck, candidate, frozenset(blocked))
+            if path:
+                paths[truck.id] = path
+                staging_poses[truck.id] = candidate
+                blocked.update(_path_cells(grid, path))
+                print(f"[STAGING] Truck {truck.id}: selected score={candidate.score:.2f}, path_len={len(path)}")
+                break
+        if not paths[truck.id]:
+            print(f"[STAGING] Truck {truck.id}: no reachable staging pose")
+    return paths, staging_poses
 
 def _turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells):
     # Penalise direction changes to discourage zig-zag paths.

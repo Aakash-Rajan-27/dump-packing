@@ -1,2 +1,5 @@
 __pycache__/
 aditya_ritvik_clashes/
+.venv/
+venv/
+*.png

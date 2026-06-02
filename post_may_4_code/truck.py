@@ -63,7 +63,11 @@
 
 import numpy as np  # numerical operations (arctan2, pi)
 import math  # math.hypot for Euclidean distance
-from config import TRUCK_CLASSES, ENTRY_POINT, _TAN_REPOSE, TRAIL_STRENGTH, TRAIL_RADIUS_M
+from config import (TRUCK_CLASSES, ENTRY_POINT, _TAN_REPOSE, TRAIL_STRENGTH,
+                    TRAIL_RADIUS_M, REVERSE_DUMP_CLOSE_ENOUGH_M,
+                    REVERSE_DUMP_STEP_M)
+from filters import is_pose_driveable
+from staging import required_dump_clearance_m
 
 
 class Truck:
@@ -101,6 +105,7 @@ class Truck:
         self.stop_target = None              # (row, col) where the truck stops before reversing
         self._dump_ticks = 0                 # tick counter for the current dump operation
         self._exit_path  = []                # waypoints for the return trip to the entry point
+        self.staging_pose = None             # outward-facing pose reached before reversing
 
     def front_center_world(self):
         half_len = self.length / 2.0
@@ -170,9 +175,10 @@ class Truck:
             )
         return waypoint
 
-    def set_path(self, path, dump_target, grid):
+    def set_path(self, path, dump_target, grid, staging_pose=None):
         self.path        = list(path)   # copy the path so mutations outside don't affect us
         self.dump_target = dump_target  # remember which cell we're filling this trip
+        self.staging_pose = staging_pose
 
         if not self.path:  # if A* returned an empty path (truck is already there or fully blocked)
             if self.dump_target:
@@ -217,7 +223,7 @@ class Truck:
                 tr, tc = self.front_center_cell(grid)  # path targets the truck's front centre, not its body centre
                 stop_cell = self._waypoint_to_cell(grid, self.stop_target) if self.stop_target else None
                 if stop_cell and (tr, tc) == stop_cell:  # did we land exactly on the stop cell?
-                    if self.dump_target:
+                    if self.dump_target and self.staging_pose is None:
                         dr, dc = self.dump_target
                         dtx, dty = grid.cell_to_world(dr, dc)
                         self.heading = np.arctan2(self.pos[1] - dty, self.pos[0] - dtx)  # face away from dump cell (truck will reverse into it)
@@ -229,8 +235,27 @@ class Truck:
                     self.status = self.STATUS_IDLE  # fall back to idle; the assignment loop will try again
 
         elif self.status == self.STATUS_REVERSING:
-            self.status      = self.STATUS_DUMPING  # immediately advance to DUMPING (reversing is instantaneous in this model)
-            self._dump_ticks = 0                    # reset tick counter for the fresh dump
+            if self.dump_target is None or self.staging_pose is None:
+                self.status      = self.STATUS_DUMPING
+                self._dump_ticks = 0
+                return
+
+            dump_x, dump_y = grid.cell_to_world(*self.dump_target)
+            rear_x, rear_y = self.rear_axle_world()
+            clearance = required_dump_clearance_m(self)
+            if math.hypot(rear_x - dump_x, rear_y - dump_y) <= clearance + REVERSE_DUMP_CLOSE_ENOUGH_M:
+                self.status      = self.STATUS_DUMPING
+                self._dump_ticks = 0
+                return
+
+            next_x = self.pos[0] - math.cos(self.heading) * REVERSE_DUMP_STEP_M
+            next_y = self.pos[1] - math.sin(self.heading) * REVERSE_DUMP_STEP_M
+            if is_pose_driveable(grid, self, next_x, next_y, self.heading):
+                self.pos[0], self.pos[1] = next_x, next_y
+                r, c = grid.world_to_cell(next_x, next_y)
+                grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
+            else:
+                print(f"[STAGING] Truck {self.id}: reverse segment unexpectedly blocked")
 
         elif self.status == self.STATUS_DUMPING:
             self._dump_ticks += 1  # count this tick toward the required dump duration
@@ -242,6 +267,7 @@ class Truck:
                 if self.dump_target:
                     grid.unreserve(*self.dump_target)  # release reservation now that this cell has been filled
                     self.dump_target = None             # clear target so needs_exit_path() triggers correctly
+                    self.staging_pose = None
                 self.status = self.STATUS_EXITING       # start the return journey
 
         elif self.status == self.STATUS_EXITING:

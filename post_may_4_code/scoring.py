@@ -87,7 +87,7 @@ def score_candidates(grid, candidate_idxs, state_override=None):
     score_candidates.call_count += 1
 
     # 2. Trigger the heatmap exactly on the 10th planning phase
-    if score_candidates.call_count == 10:
+    """if score_candidates.call_count == 10: 
         import matplotlib.pyplot as plt
         
         plt.figure(figsize=(10, 8))
@@ -102,7 +102,7 @@ def score_candidates(grid, candidate_idxs, state_override=None):
         plt.savefig("scoring_heatmap.png", bbox_inches='tight', dpi=300)
         print("\n[DEBUG] Saved high-res scoring_heatmap.png to your folder! Put this on Slide 4.")
     # ──────────────────────────────────────────
-
+"""
     rows = [rc[0] for rc in candidate_idxs]
     cols = [rc[1] for rc in candidate_idxs]
     return combined[rows, cols]
