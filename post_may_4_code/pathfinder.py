@@ -241,7 +241,14 @@ def _pose_allowed(grid, truck, x, y, heading):
     return is_pose_driveable(grid, truck, x, y, heading)
 
 
-def _hybrid_primitive(grid, truck, x, y, heading, turn):
+def _mask_pose_allowed(grid, driveable, x, y, heading):
+    if math.hypot(x - ENTRY_POINT[0], y - ENTRY_POINT[1]) <= 15.0:
+        return True
+    r, c = grid.world_to_cell(x, y)
+    return bool(driveable[r, c, _pose_bucket(heading)])
+
+
+def _hybrid_primitive(grid, truck, driveable, x, y, heading, turn):
     """Generate one forward bicycle primitive and its intermediate body poses."""
     heading_step = 2.0 * math.pi / POSE_HEADING_BUCKETS
     travel = grid.cell_size if turn == 0 else max(grid.cell_size, truck.turn_radius * heading_step)
@@ -255,14 +262,27 @@ def _hybrid_primitive(grid, truck, x, y, heading, turn):
         x += math.cos(mid_heading) * ds
         y += math.sin(mid_heading) * ds
         heading = (heading + d_heading + math.pi) % (2.0 * math.pi) - math.pi
-        if not _pose_allowed(grid, truck, x, y, heading):
+        if not _mask_pose_allowed(grid, driveable, x, y, heading):
             return None
         poses.append((x, y, heading))
     return poses
 
 
-def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset()):
+def _route_exactly_driveable(grid, truck, path):
+    half_len = truck.length / 2.0
+    for rear_x, rear_y, heading in path:
+        body_x = rear_x + math.cos(heading) * half_len
+        body_y = rear_y + math.sin(heading) * half_len
+        if not _pose_allowed(grid, truck, body_x, body_y, heading):
+            return False
+    return True
+
+
+def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset(), driveable=None):
     """Plan forward bicycle arcs to an outward-facing staging pose."""
+    if driveable is None:
+        driveable = make_driveable_mask(grid, truck)
+
     start_rc = grid.world_to_cell(*truck.pos)
     start = (start_rc[0], start_rc[1], _pose_bucket(truck.heading))
     open_heap = [(0.0, 0.0, start)]
@@ -285,8 +305,8 @@ def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset()
             terminal = state
             break
 
-        for turn in (-1, 0, 1):
-            primitive = _hybrid_primitive(grid, truck, x, y, heading, turn)
+        for turn in (0, -1, 1):
+            primitive = _hybrid_primitive(grid, truck, driveable, x, y, heading, turn)
             if not primitive:
                 continue
             nx, ny, nh = primitive[-1]
@@ -295,7 +315,8 @@ def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset()
             if next_state == state:
                 continue
             traffic_cost = 10.0 if (nr, nc) in blocked_cells else 0.0
-            new_g = g + len(primitive) * TRUCK_MOVE_STEP_M + traffic_cost
+            turn_cost = 0.0 if turn == 0 else 0.35 * truck.turn_radius * (2.0 * math.pi / POSE_HEADING_BUCKETS)
+            new_g = g + len(primitive) * TRUCK_MOVE_STEP_M + turn_cost + traffic_cost
             if new_g >= g_cost.get(next_state, float('inf')):
                 continue
             g_cost[next_state] = new_g
@@ -328,7 +349,7 @@ def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset()
         x = connector_start[0] + ratio * dx
         y = connector_start[1] + ratio * dy
         heading = connector_start[2] + ratio * heading_delta
-        if not _pose_allowed(grid, truck, x, y, heading):
+        if not _mask_pose_allowed(grid, driveable, x, y, heading):
             return []
         body_poses.append((x, y, heading))
     half_len = truck.length / 2.0
@@ -348,13 +369,18 @@ def plan_staging_paths(grid, assignments, locked_paths=None):
 
     paths = {}
     staging_poses = {}
+    mask_cache = {}
     for truck, dump_target in assignments:
+        if truck.truck_class not in mask_cache:
+            mask_cache[truck.truck_class] = make_driveable_mask(grid, truck)
+        driveable = mask_cache[truck.truck_class]
+
         paths[truck.id] = []
         staging_poses[truck.id] = None
         candidates = score_staging_candidates(grid, truck, dump_target)
         print(f"[STAGING] Truck {truck.id}: {len(candidates)} valid candidates")
         for candidate in candidates:
-            path = hybrid_astar_to_staging(grid, truck, candidate, frozenset(blocked))
+            path = hybrid_astar_to_staging(grid, truck, candidate, frozenset(blocked), driveable)
             if path:
                 paths[truck.id] = path
                 staging_poses[truck.id] = candidate
