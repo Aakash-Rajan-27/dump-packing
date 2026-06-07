@@ -90,6 +90,8 @@ CONFIG_MATERIAL_HEIGHT_THRESHOLD = 0.70
 # ── Scoring filter sizes ───────────────────────────────────
 SCORE_FILTER_SIZE    = int(round(24.0 / CELL_SIZE))
 ENTRY_CORRIDOR_CELLS = max(1, int(round(9.0 / CELL_SIZE)))
+ENTRY_MIN_QUEUE_TO_SPAWN = 2
+ENTRY_EXIT_HOLD_RADIUS_M = 12.0
 
 # ── Pheromone ──────────────────────────────────────────────
 PHEROMONE_DECAY = 0.85
@@ -112,6 +114,7 @@ ASTAR_WAIT_COST = 4.0
 # forcing the planner to route around near-future conflicts rather than
 # waiting for the entire remaining path of every other truck to clear.
 LOCKED_PATH_HORIZON = 25
+SPACE_TIME_CONFLICT_TIME_OFFSET = 6
 
 # ── MCTS ───────────────────────────────────────────────────
 MCTS_SIMULATIONS = 200

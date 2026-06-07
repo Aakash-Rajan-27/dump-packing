@@ -65,7 +65,7 @@ import numpy as np  # numerical operations (arctan2, pi)
 import math  # math.hypot for Euclidean distance
 from config import (TRUCK_CLASSES, ENTRY_POINT, _TAN_REPOSE, TRAIL_STRENGTH,
                     TRAIL_RADIUS_M, REVERSE_DUMP_CLOSE_ENOUGH_M,
-                    REVERSE_DUMP_STEP_M)
+                    REVERSE_DUMP_STEP_M, ENTRY_CORRIDOR_CELLS)
 from filters import is_pose_driveable
 from staging import required_dump_clearance_m
 
@@ -102,6 +102,7 @@ class Truck:
         self.pos      = list(start_pos if start_pos else ENTRY_POINT)
         self.home_pos = list(home_pos if home_pos else ENTRY_POINT)  # outside parking position
         self.heading  = np.pi / 2  # initial heading: pointing "up" (north) in world coords
+        self.on_grid  = not waiting  # off-grid trucks are queued/planned but not physically rendered/collided
 
         self.status      = self.STATUS_WAITING if waiting else self.STATUS_IDLE  # WAITING = held outside until released
         self.path        = []                # ordered list of (row, col) waypoints to follow
@@ -120,6 +121,9 @@ class Truck:
         self._pre_path         = None        # path pre-planned while truck is WAITING
         self._pre_dump_target  = None        # dump target reserved during pre-planning
         self._pre_staging_pose = None        # staging pose for the pre-planned path
+        self._last_deadlock_reverser = None  # remembers who yielded last in a pairwise deadlock
+        self._collision_peer = None          # most recent truck id that blocked this truck
+        self._deadlock_retreat_steps = 0     # active retreat waypoints should not create new collision deadlocks
 
     def front_center_world(self):
         half_len = self.length / 2.0
@@ -137,6 +141,37 @@ class Truck:
             self.pos[0] - math.cos(self.heading) * half_len,
             self.pos[1] - math.sin(self.heading) * half_len,
         )
+
+    def touches_entry_zone(self, grid):
+        """True when any part of the truck rectangle touches the entry zone."""
+        zone_radius = ENTRY_CORRIDOR_CELLS * grid.cell_size
+        ex, ey = ENTRY_POINT
+        dx = ex - self.pos[0]
+        dy = ey - self.pos[1]
+        hx, hy = math.cos(self.heading), math.sin(self.heading)
+        sx, sy = -hy, hx
+        local_x = dx * hx + dy * hy
+        local_y = dx * sx + dy * sy
+        outside_x = max(abs(local_x) - self.length / 2.0, 0.0)
+        outside_y = max(abs(local_y) - self.width / 2.0, 0.0)
+        return math.hypot(outside_x, outside_y) <= zone_radius
+
+    def remove_to_entry_idle(self, grid=None):
+        """Take the truck out of physical grid traffic while keeping it schedulable."""
+        if grid is not None:
+            self._clear_exit_corridor(grid)
+        self.pos[0], self.pos[1] = ENTRY_POINT
+        self.heading = math.pi / 2
+        self.status = self.STATUS_IDLE
+        self.on_grid = False
+        self.path = []
+        self._exit_path = []
+        self._leaving_waypoints = []
+        self.stop_target = None
+        self.staging_pose = None
+        self._stuck_substeps = 0
+        self._collision_peer = None
+        self._deadlock_retreat_steps = 0
 
     def front_axle_world(self):
         return self.front_center_world()
@@ -273,6 +308,11 @@ class Truck:
             self.status = self.STATUS_IDLE          # stay idle — nothing to do
             return
 
+        if not self.on_grid:
+            self.pos[0], self.pos[1] = ENTRY_POINT
+            self.heading = math.pi / 2
+            self.on_grid = True
+
         self.stop_target = self.path[-1]    # the last waypoint is where the truck parks before reversing
         self.status = self.STATUS_NAVIGATING  # begin driving toward the dump position
         if dump_target:
@@ -283,9 +323,8 @@ class Truck:
         if exit_path:  # only switch state if a valid exit path was found
             self._exit_path = list(exit_path)      # store a copy of the exit waypoints
             self.status     = self.STATUS_EXITING  # truck will start following the exit path next tick
-            # Exit corridors are NOT marked PATH_RESERVED — all exits converge to the
-            # same entry point and marking them would block other trucks from reaching it.
-            # CBS space-time constraints handle temporal separation between exiting trucks.
+            self._mark_exit_corridor(grid, self._exit_path)
+            # Exit corridors use the same truck-width PATH_RESERVED overlay as dump paths.
         else:
             # CBS returned an empty path — leave status as EXITING so the main loop retries next tick.
             pass
@@ -414,6 +453,10 @@ class Truck:
                 self.status = self.STATUS_EXITING       # start the return journey
 
         elif self.status == self.STATUS_EXITING:
+            if self.touches_entry_zone(grid):
+                self.remove_to_entry_idle(grid)
+                return
+
             if self._exit_path:
                 waypoint = self._exit_path.pop(0)      # consume the next exit waypoint
                 tx, ty, heading = self._waypoint_to_pose(grid, waypoint)
@@ -422,7 +465,12 @@ class Truck:
                 r, c = grid.world_to_cell(tx, ty)
                 grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
 
+                if self.touches_entry_zone(grid):
+                    self.remove_to_entry_idle(grid)
+                    return
+
                 if not self._exit_path:                # CBS exit path done — drive through corridor and out
+                    self._clear_exit_corridor(grid)
                     self._leaving_waypoints = [tuple(ENTRY_POINT), tuple(self.home_pos)]
                     self.status      = self.STATUS_LEAVING
                     self.path        = []
@@ -440,6 +488,7 @@ class Truck:
         """Move truck from WAITING to ENTERING so it drives to the entry point."""
         if self.status == self.STATUS_WAITING:
             self.status = self.STATUS_ENTERING
+            self.on_grid = True
 
     def is_idle(self):
         return self.status == self.STATUS_IDLE  # convenience predicate used by the assignment loop
@@ -448,3 +497,4 @@ class Truck:
         # human-readable string for debugging print statements
         return (f"Truck({self.id}, class={self.truck_class}, "
                 f"pos={self.pos}, status={self.status})")
+

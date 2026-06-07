@@ -20,7 +20,7 @@ from config import (DRIVE_CLEARANCE_M, _TAN_REPOSE, ENTRY_POINT,
                     TURN_LOOKAHEAD_RADIUS_FACTOR, TURN_PATH_TOLERANCE_M,
                     TURN_MAX_SMOOTH_STEPS, POSE_HEADING_BUCKETS,
                     ASTAR_WAIT_COST, LOCKED_PATH_HORIZON,
-                    ENTRY_CORRIDOR_CELLS)
+                    ENTRY_CORRIDOR_CELLS, SPACE_TIME_CONFLICT_TIME_OFFSET)
 from staging import score_staging_candidates
 
 
@@ -138,6 +138,67 @@ def _path_cells(grid, path):
         else:
             cells.append((wp[0], wp[1]))
     return cells
+
+def _in_entry_zone_cell(grid, r, c):
+    entry_r, entry_c = grid.world_to_cell(*ENTRY_POINT)
+    return math.hypot(r - entry_r, c - entry_c) <= ENTRY_CORRIDOR_CELLS
+
+def _add_locked_time_window(locked, r, c, t, max_time):
+    for dt in range(-SPACE_TIME_CONFLICT_TIME_OFFSET,
+                    SPACE_TIME_CONFLICT_TIME_OFFSET + 1):
+        tt = t + dt
+        if 0 <= tt <= max_time:
+            locked.add((r, c, tt))
+
+def _current_wait_waypoint(truck):
+    if truck is None:
+        return None
+    if hasattr(truck, "rear_axle_world"):
+        rear_x, rear_y = truck.rear_axle_world()
+        return (rear_x, rear_y, truck.heading)
+    return None
+
+def _prepend_wait(path, wait_steps, wait_waypoint=None):
+    """Delay a planned path by repeating its first waypoint."""
+    if not path or wait_steps <= 0:
+        return path
+    first = wait_waypoint if wait_waypoint is not None else path[0]
+    return [first for _ in range(wait_steps)] + list(path)
+
+def _resolve_conflicts_with_waits(grid, paths, truck_map, max_rounds=80, wait_steps=4):
+    """
+    Resolve space-time path conflicts by delaying one truck at the start.
+
+    This keeps the old CBS code available below, but the active policy is now:
+    when two paths conflict, the truck with the longer remaining route waits a
+    few steps while the other continues. We repeat until the current path set is
+    conflict-free or the guard limit is reached.
+    """
+    resolved = {aid: list(path or []) for aid, path in paths.items()}
+
+    for _ in range(max_rounds):
+        cell_paths = {aid: _path_cells(grid, path)
+                      for aid, path in resolved.items() if path}
+        conflict = _detect_first_conflict(cell_paths, truck_map=truck_map, grid=grid)
+        if conflict is None:
+            return resolved
+
+        if conflict[0] == 'vertex':
+            _, ai, aj, _ri, _ci, _rj, _cj, _t = conflict
+        else:
+            _, ai, aj, _r1, _c1, _r2, _c2, _t = conflict
+
+        len_ai = len(resolved.get(ai, []))
+        len_aj = len(resolved.get(aj, []))
+        waiter = ai if len_ai >= len_aj else aj
+        wait_pose = _current_wait_waypoint(truck_map.get(waiter))
+        resolved[waiter] = _prepend_wait(resolved.get(waiter, []),
+                                         wait_steps, wait_pose)
+        print(f"[WAIT-RESOLVE] T{waiter} waits {wait_steps} steps for T"
+              f"{aj if waiter == ai else ai} to pass.")
+
+    print("[WAIT-RESOLVE] Guard limit hit; returning best delayed paths.")
+    return resolved
 
 def _truck_front_cell(grid, truck):
     if hasattr(truck, "front_center_cell"):
@@ -581,18 +642,22 @@ def plan_staging_paths(grid, assignments, locked_paths=None):
             for t, (r, c) in enumerate(cells):
                 if t > LOCKED_PATH_HORIZON:
                     break
-                locked_st.add((r, c, t))
+                if _in_entry_zone_cell(grid, r, c):
+                    continue
+                _add_locked_time_window(locked_st, r, c, t, LOCKED_PATH_HORIZON)
             if cells:
                 fr, fc = cells[min(len(cells) - 1, LOCKED_PATH_HORIZON)]
-                for t in range(len(cells), LOCKED_PATH_HORIZON + 1):
-                    locked_st.add((fr, fc, t))
+                if not _in_entry_zone_cell(grid, fr, fc):
+                    for t in range(len(cells), LOCKED_PATH_HORIZON + 1):
+                        _add_locked_time_window(locked_st, fr, fc, t, LOCKED_PATH_HORIZON)
 
     # ── PER-AGENT SETUP ───────────────────────────────────────────────────────────
     mask_cache = {}
     agent_info = {}
     for truck, dump_target in assignments:
         if truck.truck_class not in mask_cache:
-            mask_cache[truck.truck_class] = make_driveable_mask(grid, truck)
+            mask_cache[truck.truck_class] = make_driveable_mask(
+                grid, truck, ignore_path_reserved=True)
         driveable  = mask_cache[truck.truck_class]
         truck_cell = _truck_front_cell(grid, truck)
 
@@ -637,6 +702,21 @@ def plan_staging_paths(grid, assignments, locked_paths=None):
         aid        = next(iter(agent_info))
         path, pose = _plan_one(aid, set())
         return {aid: path}, {aid: pose}
+
+    # Active policy: no CBS branching for now. Plan each dump path once, then
+    # resolve space-time conflicts by delaying one truck while the other passes.
+    # The old CBS high-level search is retained below, but this return keeps it
+    # inactive until we want hard constraint-tree replanning again.
+    init_paths = {}
+    init_staging = {}
+    for aid in agent_info:
+        p, sp = _plan_one(aid, set())
+        init_paths[aid] = p
+        init_staging[aid] = sp
+
+    truck_map = {aid: agent_info[aid]['truck'] for aid in agent_info}
+    waited_paths = _resolve_conflicts_with_waits(grid, init_paths, truck_map)
+    return waited_paths, init_staging
 
     # ── CBS HIGH-LEVEL SEARCH ─────────────────────────────────────────────────────
     init_cons    = {aid: set() for aid in agent_info}
@@ -941,21 +1021,23 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
         # ── VERTEX CONFLICT CHECK (physical footprint) ────────────────────────────
         # Collect every agent's position at this timestep, then check each pair.
         # Two agents conflict when their cell-centre distance < sum of bounding radii.
-        positions = {}
-        for aid in agent_ids:
-            p = pos_at(paths_dict[aid], t)
-            if p is not None:
-                positions[aid] = p
-
-        aids_present = list(positions.keys())
-        for i in range(len(aids_present)):
-            for j in range(i + 1, len(aids_present)):
-                ai, aj = aids_present[i], aids_present[j]
-                pi, pj = positions[ai], positions[aj]
+        for i in range(len(agent_ids)):
+            for j in range(i + 1, len(agent_ids)):
+                ai, aj = agent_ids[i], agent_ids[j]
+                pi = pos_at(paths_dict[ai], t)
+                if pi is None:
+                    continue
                 clearance = radius_cache[ai] + radius_cache[aj]
-                if math.hypot(pi[0] - pj[0], pi[1] - pj[1]) < clearance:
-                    # Skip conflicts inside the entry corridor — trucks funnel through
-                    # a single exit point so proximity there is expected and unresolvable.
+                for dt in range(-SPACE_TIME_CONFLICT_TIME_OFFSET,
+                                SPACE_TIME_CONFLICT_TIME_OFFSET + 1):
+                    tj = t + dt
+                    if tj < 0:
+                        continue
+                    pj = pos_at(paths_dict[aj], tj)
+                    if pj is None:
+                        continue
+                    if math.hypot(pi[0] - pj[0], pi[1] - pj[1]) >= clearance:
+                        continue
                     entry_rc = None
                     if grid is not None:
                         entry_rc = grid.world_to_cell(*ENTRY_POINT)
@@ -964,10 +1046,11 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
                         dj = math.hypot(pj[0] - entry_rc[0], pj[1] - entry_rc[1])
                         if di <= ENTRY_CORRIDOR_CELLS or dj <= ENTRY_CORRIDOR_CELLS:
                             continue
-                    print(f"[CONFLICT] VERTEX: trucks {ai} and {aj} too close at t={t} "
-                          f"— T{ai}@({pi[0]},{pi[1]}) T{aj}@({pj[0]},{pj[1]}) "
+                    conflict_t = max(t, tj)
+                    print(f"[CONFLICT] VERTEX: trucks {ai} and {aj} too close at t={conflict_t} "
+                          f"-- T{ai}@({pi[0]},{pi[1]}) T{aj}@({pj[0]},{pj[1]}) "
                           f"dist={math.hypot(pi[0]-pj[0],pi[1]-pj[1]):.2f} clearance={clearance:.2f}")
-                    return ('vertex', ai, aj, pi[0], pi[1], pj[0], pj[1], t)
+                    return ('vertex', ai, aj, pi[0], pi[1], pj[0], pj[1], conflict_t)
 
         # ── EDGE (SWAP) CONFLICT CHECK ────────────────────────────────────────────
         # Two trucks passing through each other is physically impossible at any size.
@@ -1024,14 +1107,19 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
             for t, (r, c) in enumerate(cells):
                 if t > LOCKED_PATH_HORIZON:
                     break
-                locked_st_constraints.add((r, c, t))
+                if _in_entry_zone_cell(grid, r, c):
+                    continue
+                _add_locked_time_window(locked_st_constraints, r, c, t,
+                                        LOCKED_PATH_HORIZON)
             # The locked truck stays at its final cell once its path ends — lock that
             # cell for all timesteps from path-end up to the horizon so newly-planned
             # trucks cannot walk through a parked truck.
             if cells:
                 final_r, final_c = cells[min(len(cells) - 1, LOCKED_PATH_HORIZON)]
-                for t in range(len(cells), LOCKED_PATH_HORIZON + 1):
-                    locked_st_constraints.add((final_r, final_c, t))
+                if not _in_entry_zone_cell(grid, final_r, final_c):
+                    for t in range(len(cells), LOCKED_PATH_HORIZON + 1):
+                        _add_locked_time_window(locked_st_constraints, final_r, final_c,
+                                                t, LOCKED_PATH_HORIZON)
 
 
     # ── PER-AGENT SETUP ───────────────────────────────────────────────────────────
@@ -1112,6 +1200,26 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
                          stop_dist_cells=info['stop_dist'])
             path = _at_target_fix(path, aid)
         return smooth_paths({aid: path})
+
+    # Active policy: no CBS branching for now. Plan exit/general paths once,
+    # then handle any space-time conflict by delaying one truck at its current
+    # pose while the other continues.
+    init_paths = {}
+    for aid in agent_info:
+        info = agent_info[aid]
+        path = astar_st(info['driveable'], grid, info['start'], info['target'],
+                        info['truck'], locked_st_constraints, info['stop_dist'])
+        path = _at_target_fix(path, aid)
+        if not path:
+            path = astar(info['driveable'], grid, info['start'], info['target'],
+                         info['truck'], blocked_cells=frozenset(),
+                         stop_dist_cells=info['stop_dist'])
+            path = _at_target_fix(path, aid)
+        init_paths[aid] = path
+
+    smoothed = smooth_paths(init_paths)
+    truck_map = {aid: agent_info[aid]['truck'] for aid in agent_info}
+    return _resolve_conflicts_with_waits(grid, smoothed, truck_map)
 
     # ── CBS HIGH-LEVEL SEARCH ─────────────────────────────────────────────────────
     # Root: plan every truck independently (no CBS constraints yet).

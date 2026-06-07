@@ -75,6 +75,8 @@ class GridMap:
         self.pheromone = np.ones ((self.rows, self.cols), dtype=np.float32)
 
         self._path_corridors: dict = {}  # key -> list of (r, c, original_state)
+        self._path_corridor_counts = {}
+        self._path_corridor_base = {}
 
         self._classify_cells()
         self._mark_entry_corridor()
@@ -127,15 +129,25 @@ class GridMap:
                         continue
                     seen.add((nr, nc))
                     orig = int(self.state[nr, nc])
-                    if orig in self._CORRIDOR_RESTORABLE:
+                    if orig in self._CORRIDOR_RESTORABLE or orig == CellState.PATH_RESERVED:
                         saved.append((nr, nc, orig))
+                        if (nr, nc) not in self._path_corridor_counts:
+                            self._path_corridor_base[(nr, nc)] = orig
+                        self._path_corridor_counts[(nr, nc)] = (
+                            self._path_corridor_counts.get((nr, nc), 0) + 1)
                         self.state[nr, nc] = CellState.PATH_RESERVED
         self._path_corridors[key] = saved
 
     def clear_path_corridor(self, key):
         """Restore cells that were marked PATH_RESERVED under this key.
         Safe to call even if the key was never registered."""
-        for r, c, orig in self._path_corridors.pop(key, []):
+        for r, c, _orig in self._path_corridors.pop(key, []):
+            count = self._path_corridor_counts.get((r, c), 0) - 1
+            if count > 0:
+                self._path_corridor_counts[(r, c)] = count
+                continue
+            self._path_corridor_counts.pop((r, c), None)
+            orig = self._path_corridor_base.pop((r, c), CellState.EMPTY)
             if self.state[r, c] == CellState.PATH_RESERVED:
                 self.state[r, c] = orig
                 self._update_state(r, c)  # reclassify from z_height if EMPTY/PARTIAL

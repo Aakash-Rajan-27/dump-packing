@@ -87,6 +87,8 @@ class Renderer:
         self._draw_paths(trucks)       # planned-path overlay (under trucks)
         self._draw_dump_radii(trucks)
         for truck in trucks:
+            if not getattr(truck, "on_grid", True):
+                continue
             self._draw_truck(truck)
         self.screen.blit(self.grid_surface, (0, 0))
         self._draw_panel(metrics, trucks)
@@ -104,6 +106,8 @@ class Renderer:
         DOT_R  = max(1, self.scale // 3)
 
         for truck in trucks:
+            if not getattr(truck, "on_grid", True):
+                continue
             if truck.status == truck.STATUS_NAVIGATING and truck.path:
                 waypoints = truck.path
             elif truck.status == truck.STATUS_EXITING and truck._exit_path:

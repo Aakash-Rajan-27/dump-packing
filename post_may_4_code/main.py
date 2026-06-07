@@ -21,7 +21,8 @@ from config import (POLYGON_BOUNDARY, ENTRY_POINT, CELL_SIZE,
                     FLEET_COMPOSITION, TICK_DELAY, PYGAME_SCALE,
                     PHEROMONE_DECAY, PHEROMONE_SPREAD_SIGMA,
                     CONFIG_MATERIAL_HEIGHT_THRESHOLD, STEPS_PER_TICK,
-                    ENTRY_CORRIDOR_CELLS)
+                    ENTRY_CORRIDOR_CELLS, ENTRY_MIN_QUEUE_TO_SPAWN,
+                    ENTRY_EXIT_HOLD_RADIUS_M)
 import grid_map
 from truck      import Truck
 from filters    import get_raw_candidates, is_accessible, precompute_coarse_blocked_mask
@@ -137,6 +138,29 @@ def _try_inplace_replan(ta, tb, grid, entry_rc):
     return False
 
 
+def _prepend_current_pose_wait(truck, wait_steps):
+    """Hold a moving truck at its current rear-axle pose for a few substeps."""
+    if wait_steps <= 0:
+        return
+    rear_x, rear_y = truck.rear_axle_world()
+    wait_wps = [(rear_x, rear_y, truck.heading) for _ in range(wait_steps)]
+    if truck.status == truck.STATUS_NAVIGATING:
+        truck.path = wait_wps + list(truck.path)
+    elif truck.status == truck.STATUS_EXITING:
+        truck._exit_path = wait_wps + list(truck._exit_path)
+
+
+def _exit_near_entry_zone(trucks, entry_radius_m):
+    entry_x, entry_y = ENTRY_POINT
+    hold_radius = ENTRY_CORRIDOR_CELLS * CELL_SIZE + entry_radius_m
+    for truck in trucks:
+        if (getattr(truck, "on_grid", True)
+                and truck.status == truck.STATUS_EXITING
+                and math.hypot(truck.pos[0] - entry_x, truck.pos[1] - entry_y) <= hold_radius):
+            return True
+    return False
+
+
 def run_simulation():
     print("Initialising grid...")
     grid = grid_map.GridMap(POLYGON_BOUNDARY, CELL_SIZE)
@@ -217,6 +241,8 @@ def run_simulation():
                                     for _ot in trucks:
                                         if _ot is next_t:
                                             continue
+                                        if not getattr(_ot, "on_grid", True):
+                                            continue
                                         if _ot.status == _ot.STATUS_NAVIGATING and _ot.path:
                                             _locked[_ot.id] = ([_ot.front_center_cell(grid)]
                                                                + list(_ot.path))
@@ -241,9 +267,13 @@ def run_simulation():
             # ── RELEASE: gate clear AND pre-plan ready ────────────────────────────
             any_transiting = any(t.status in (t.STATUS_ENTERING, t.STATUS_LEAVING)
                                  for t in trucks)
-            if next_t._pre_path and not any_transiting:
+            enough_queued = len(waiting_queue) >= ENTRY_MIN_QUEUE_TO_SPAWN
+            exit_near_entry = _exit_near_entry_zone(trucks, ENTRY_EXIT_HOLD_RADIUS_M)
+            if next_t._pre_path and enough_queued and not any_transiting and not exit_near_entry:
                 entry_x, entry_y = ENTRY_POINT
-                active = [t for t in trucks if t.status not in (t.STATUS_WAITING,)]
+                active = [t for t in trucks
+                          if getattr(t, "on_grid", True)
+                          and t.status not in (t.STATUS_WAITING,)]
                 if active:
                     nearest_dist = min(
                         math.hypot(t.pos[0] - entry_x, t.pos[1] - entry_y)
@@ -260,11 +290,16 @@ def run_simulation():
         exiting_trucks = [t for t in trucks if t.needs_exit_path()]
         if exiting_trucks:
             exit_assignments = [(t, entry_rc) for t in exiting_trucks]
-            # Pass the remaining paths of all currently navigating trucks as locked paths
-            # so the new exit routes don't cross through them.
-            nav_locked = {t.id: [t.front_center_cell(grid)] + list(t.path)
-                          for t in trucks if t.status == t.STATUS_NAVIGATING and t.path}
-            exit_paths = plan_paths_cbs(grid, exit_assignments, locked_paths=nav_locked)
+            being_exit_planned = {t for t, _ in exit_assignments}
+            locked_moving = {}
+            for t in trucks:
+                if t in being_exit_planned or not getattr(t, "on_grid", True):
+                    continue
+                if t.status == t.STATUS_NAVIGATING and t.path:
+                    locked_moving[t.id] = [t.front_center_cell(grid)] + list(t.path)
+                elif t.status == t.STATUS_EXITING and t._exit_path:
+                    locked_moving[t.id] = [t.front_center_cell(grid)] + list(t._exit_path)
+            exit_paths = plan_paths_cbs(grid, exit_assignments, locked_paths=locked_moving)
             for t, _ in exit_assignments:
                 t.set_exit_path(exit_paths.get(t.id, []), grid)
 
@@ -340,6 +375,8 @@ def run_simulation():
                     for t in trucks:
                         if t in being_planned:
                             continue  # this truck IS being planned — don't lock its old path
+                        if not getattr(t, "on_grid", True):
+                            continue
                         if t.status == t.STATUS_NAVIGATING and t.path:
                             all_locked[t.id] = [t.front_center_cell(grid)] + list(t.path)
                         elif t.status == t.STATUS_EXITING and t._exit_path:
@@ -360,7 +397,9 @@ def run_simulation():
         cached_pack = grid.pack_pct() * 100
 
         # Active (non-waiting) trucks for collision checks — computed once per tick.
-        active_trucks = [t for t in trucks if t.status != t.STATUS_WAITING]
+        active_trucks = [t for t in trucks
+                         if getattr(t, "on_grid", True)
+                         and t.status != t.STATUS_WAITING]
 
         for substep in range(STEPS_PER_TICK):
             if renderer.check_quit():
@@ -372,27 +411,42 @@ def run_simulation():
                 prev_heading       = truck.heading
                 prev_first_wp      = truck.path[0]       if truck.path       else None
                 prev_exit_first_wp = truck._exit_path[0] if truck._exit_path else None
+                was_retreating     = truck._deadlock_retreat_steps > 0
 
                 truck.step(grid)
+                if not getattr(truck, "on_grid", True):
+                    continue
 
                 # Physical collision guard: CBS plans at cell resolution and treats
                 # trucks as single points — path smoothing and physical footprints mean
                 # world-space overlaps can still occur. Revert any move that brings
                 # this truck's centre closer than the sum of the two half-lengths.
                 collided = False
+                collision_peer = None
                 for other in active_trucks:
                     if other is truck:
+                        continue
+                    if not getattr(other, "on_grid", True):
                         continue
                     dist = math.hypot(truck.pos[0] - other.pos[0],
                                       truck.pos[1] - other.pos[1])
                     if dist < (truck.length + other.length) * 0.5:
                         collided = True
+                        collision_peer = other
                         break
 
                 if collided:
-                    truck._stuck_substeps += 1
                     truck.pos[0], truck.pos[1] = prev_x, prev_y
                     truck.heading = prev_heading
+                    if was_retreating:
+                        truck._deadlock_retreat_steps = max(
+                            0, truck._deadlock_retreat_steps - 1)
+                        truck._stuck_substeps = 0
+                        truck._collision_peer = None
+                        continue
+
+                    truck._stuck_substeps += 1
+                    truck._collision_peer = collision_peer.id if collision_peer else None
                     # Restore the waypoint that step() already popped so the path
                     # stays intact — without this the truck skips a waypoint next
                     # substep and appears to teleport.
@@ -403,7 +457,11 @@ def run_simulation():
                             not truck._exit_path or truck._exit_path[0] != prev_exit_first_wp):
                         truck._exit_path.insert(0, prev_exit_first_wp)
                 else:
+                    if was_retreating:
+                        truck._deadlock_retreat_steps = max(
+                            0, truck._deadlock_retreat_steps - 1)
                     truck._stuck_substeps = 0
+                    truck._collision_peer = None
 
             metrics = {
                 'tick':       f"{tick}.{substep + 1}/{STEPS_PER_TICK}",
@@ -429,9 +487,12 @@ def run_simulation():
         # to its path so the other truck can advance clear.
         # Step 2: fall back to force-idle for any remaining single stuck trucks.
         _STUCK_LIMIT = STEPS_PER_TICK * 4
+        _COLLISION_DEADLOCK_LIMIT = STEPS_PER_TICK
 
         stuck_active = [t for t in active_trucks
-                        if t._stuck_substeps >= _STUCK_LIMIT
+                        if (t._stuck_substeps >= _STUCK_LIMIT
+                            or (t._collision_peer is not None
+                                and t._stuck_substeps >= _COLLISION_DEADLOCK_LIMIT))
                         and t.status in (t.STATUS_NAVIGATING, t.STATUS_EXITING)]
 
         _deadlock_handled = False
@@ -444,8 +505,10 @@ def run_simulation():
                     if _d >= (_ta.length + _tb.length) * 0.65:
                         continue   # not directly blocking each other
 
-                    _ret_a = generate_reverse_retreat(_ta, grid, num_steps=6)
-                    _ret_b = generate_reverse_retreat(_tb, grid, num_steps=6)
+                    _steps_a = max(1, int(math.ceil((_ta.length / 2.0) / grid.cell_size)))
+                    _steps_b = max(1, int(math.ceil((_tb.length / 2.0) / grid.cell_size)))
+                    _ret_a = generate_reverse_retreat(_ta, grid, num_steps=_steps_a)
+                    _ret_b = generate_reverse_retreat(_tb, grid, num_steps=_steps_b)
 
                     def _retreat_ok(truck, retreat, other_dump):
                         if not retreat:
@@ -466,8 +529,19 @@ def run_simulation():
                     if not _a_ok and not _b_ok:
                         continue   # neither can safely retreat — fall through to idle
 
-                    # Pick the reverser with the longer available retreat
-                    if _a_ok and (not _b_ok or len(_ret_a) >= len(_ret_b)):
+                    _last_reverser = (
+                        _ta._last_deadlock_reverser
+                        if _ta._last_deadlock_reverser == _tb._last_deadlock_reverser
+                        else None
+                    )
+
+                    if _last_reverser == _ta.id and _b_ok:
+                        _reverser, _retreat_wps = _tb, _ret_b
+                        _advancer = _ta
+                    elif _last_reverser == _tb.id and _a_ok:
+                        _reverser, _retreat_wps = _ta, _ret_a
+                        _advancer = _tb
+                    elif _a_ok and (not _b_ok or len(_ret_a) >= len(_ret_b)):
                         _reverser, _retreat_wps = _ta, _ret_a
                         _advancer = _tb
                     else:
@@ -482,8 +556,13 @@ def run_simulation():
                     elif _reverser.status == _reverser.STATUS_EXITING:
                         _reverser._exit_path = _retreat_wps + list(_reverser._exit_path)
 
+                    _reverser._deadlock_retreat_steps = len(_retreat_wps)
                     _reverser._stuck_substeps    = 0
                     _reverser._conflict_cooldown = len(_retreat_wps) + 3
+                    _ta._last_deadlock_reverser = _reverser.id
+                    _tb._last_deadlock_reverser = _reverser.id
+                    _ta._collision_peer = None
+                    _tb._collision_peer = None
                     # Give advancer a cooldown while reverser backs up
                     _advancer._conflict_cooldown = max(
                         _advancer._conflict_cooldown, len(_retreat_wps))
@@ -529,6 +608,8 @@ def run_simulation():
         for t in trucks:
             if t._conflict_cooldown > 0:
                 continue
+            if not getattr(t, "on_grid", True):
+                continue
             if t.status == t.STATUS_NAVIGATING and t.path:
                 cells = _path_cells(grid, t.path)
                 if cells:
@@ -561,32 +642,24 @@ def run_simulation():
                     _ctb = next((t for t in trucks if t.id == aj), None)
 
                     # ── Attempt in-place CBS replan (no idle, no unreserve) ──
-                    _replanned = False
+                    _replanned = False  # CBS disabled; wait-based conflict handling below
                     if _cta is not None and _ctb is not None:
-                        _replanned = _try_inplace_replan(_cta, _ctb, grid, entry_rc)
+                        pass
 
                     # ── Fall back: yield the longer-path truck to IDLE ────────
                     if not _replanned:
                         len_ai = len(nav_cell_paths.get(ai, []))
                         len_aj = len(nav_cell_paths.get(aj, []))
                         _yielder_id = ai if len_ai >= len_aj else aj
+                        _wait_steps = max(2, min(STEPS_PER_TICK, t_conf + 2))
                         for _ct in trucks:
                             if _ct.id != _yielder_id:
                                 continue
-                            _ct._conflict_cooldown = 4
+                            _prepend_current_pose_wait(_ct, _wait_steps)
+                            _ct._conflict_cooldown = _wait_steps + 2
                             _ct._stuck_substeps    = 0
-                            _ct.clear_all_corridors(grid)
-                            _ct.cancel_preload(grid)
-                            if _ct.status == _ct.STATUS_NAVIGATING:
-                                if _ct.dump_target:
-                                    grid.unreserve(*_ct.dump_target)
-                                    _ct.dump_target = None
-                                _ct.status       = _ct.STATUS_IDLE
-                                _ct.path         = []
-                                _ct.stop_target  = None
-                                _ct.staging_pose = None
-                            elif _ct.status == _ct.STATUS_EXITING:
-                                _ct._exit_path = []  # triggers needs_exit_path() next tick
+                            print(f"[WAIT] T{_ct.id} waits {_wait_steps} steps "
+                                  f"for T{aj if _ct.id == ai else ai} to pass.")
                             break
 
         tick += 1
