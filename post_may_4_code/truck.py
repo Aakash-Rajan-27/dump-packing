@@ -73,13 +73,16 @@ from staging import required_dump_clearance_m
 class Truck:
 
     # String constants for the truck's state machine — avoids typos and makes comparisons readable
+    STATUS_WAITING    = 'WAITING'     # truck is queued outside the polygon, not yet released
+    STATUS_ENTERING   = 'ENTERING'    # truck is driving from its waiting slot to the entry point
     STATUS_IDLE       = 'IDLE'        # truck is at the entry point, waiting for an assignment
     STATUS_NAVIGATING = 'NAVIGATING'  # truck is driving forward toward the dump stop position
     STATUS_REVERSING  = 'REVERSING'   # truck has arrived; one-tick state that kicks off dumping
     STATUS_DUMPING    = 'DUMPING'     # truck is actively depositing dirt over multiple ticks
     STATUS_EXITING    = 'EXITING'     # truck is driving back to the entry point after dumping
+    STATUS_LEAVING    = 'LEAVING'     # truck drives out through the entry corridor to its home position
 
-    def __init__(self, truck_id, truck_class, start_pos=None):
+    def __init__(self, truck_id, truck_class, start_pos=None, waiting=False, home_pos=None):
         self.id          = truck_id     # unique identifier for this truck (used in logs and path dicts)
         self.truck_class = truck_class  # string key into TRUCK_CLASSES config dict (e.g. 'large', 'small')
 
@@ -96,16 +99,27 @@ class Truck:
         self.payload_volume_m3 = self.payload_t / 1.8          # convert tonnes to m³ (bulk density ~1.8 t/m³)
         self.volume_per_tick   = self.payload_volume_m3 / self._dump_ticks_required  # volume deposited each tick so total sums to payload
 
-        self.pos     = list(start_pos if start_pos else ENTRY_POINT)  #CHANGE THIS FOR MULTI-DUMPS IN ONE TRIP [x, y] world position; default to entry gate
-        self.heading = np.pi / 2  # initial heading: pointing "up" (north) in world coords
+        self.pos      = list(start_pos if start_pos else ENTRY_POINT)
+        self.home_pos = list(home_pos if home_pos else ENTRY_POINT)  # outside parking position
+        self.heading  = np.pi / 2  # initial heading: pointing "up" (north) in world coords
 
-        self.status      = self.STATUS_IDLE  # start idle, waiting for an assignment
+        self.status      = self.STATUS_WAITING if waiting else self.STATUS_IDLE  # WAITING = held outside until released
         self.path        = []                # ordered list of (row, col) waypoints to follow
         self.dump_target = None              # (row, col) of the grid cell being filled this run
         self.stop_target = None              # (row, col) where the truck stops before reversing
         self._dump_ticks = 0                 # tick counter for the current dump operation
         self._exit_path  = []                # waypoints for the return trip to the entry point
         self.staging_pose = None             # outward-facing pose reached before reversing
+        self._reverse_stuck = 0             # consecutive steps where reverse was blocked
+        self._stuck_substeps = 0            # consecutive substeps reverted by collision guard
+        self._conflict_cooldown = 0         # ticks before this truck can be force-replanned again
+        self._dump_corridor_marked = False   # True while the dump-path corridor is active in the grid
+        self._exit_corridor_marked = False   # True while the exit-path corridor is active in the grid
+        self._leaving_waypoints    = []      # [ENTRY_POINT, home_pos] driven during STATUS_LEAVING
+        # Pre-planned dump path for waiting trucks (planned before entering the polygon)
+        self._pre_path         = None        # path pre-planned while truck is WAITING
+        self._pre_dump_target  = None        # dump target reserved during pre-planning
+        self._pre_staging_pose = None        # staging pose for the pre-planned path
 
     def front_center_world(self):
         half_len = self.length / 2.0
@@ -175,6 +189,77 @@ class Truck:
             )
         return waypoint
 
+    def _corridor_cells_from_path(self, grid, path):
+        """Convert a list of (rear_x, rear_y, heading) waypoints to body-centre grid cells."""
+        half_len = self.length / 2.0
+        seen = set()
+        cells = []
+        for wp in path:
+            if len(wp) == 3:
+                rx, ry, h = wp
+                bx = rx + math.cos(h) * half_len
+                by = ry + math.sin(h) * half_len
+            else:
+                bx, by = grid.cell_to_world(wp[0], wp[1])
+            cell = grid.world_to_cell(bx, by)
+            if cell not in seen:
+                seen.add(cell)
+                cells.append(cell)
+        return cells
+
+    def _mark_dump_corridor(self, grid, path):
+        if self._dump_corridor_marked:
+            grid.clear_path_corridor(f"dump_{self.id}")
+        cells = self._corridor_cells_from_path(grid, path)
+        half_w_cells = (self.width / 2.0) / grid.cell_size
+        grid.mark_path_corridor(f"dump_{self.id}", cells, half_w_cells)
+        self._dump_corridor_marked = True
+
+    def _clear_dump_corridor(self, grid):
+        if self._dump_corridor_marked:
+            grid.clear_path_corridor(f"dump_{self.id}")
+            self._dump_corridor_marked = False
+
+    def _mark_exit_corridor(self, grid, exit_path):
+        if self._exit_corridor_marked:
+            grid.clear_path_corridor(f"exit_{self.id}")
+        cells = self._corridor_cells_from_path(grid, exit_path)
+        half_w_cells = (self.width / 2.0) / grid.cell_size
+        grid.mark_path_corridor(f"exit_{self.id}", cells, half_w_cells)
+        self._exit_corridor_marked = True
+
+    def _clear_exit_corridor(self, grid):
+        if self._exit_corridor_marked:
+            grid.clear_path_corridor(f"exit_{self.id}")
+            self._exit_corridor_marked = False
+
+    def clear_all_corridors(self, grid):
+        """Clear both corridors — call when force-idling or force-replanning this truck."""
+        self._clear_dump_corridor(grid)
+        self._clear_exit_corridor(grid)
+
+    def preload_dump_path(self, path, dump_target, grid, staging_pose=None):
+        """Store a dump path pre-planned while the truck is still WAITING outside.
+        Marks the corridor and reserves the target cell so the path is committed
+        before the truck physically enters the polygon."""
+        # Clear any stale pre-plan first
+        self.cancel_preload(grid)
+        self._pre_path         = list(path)
+        self._pre_dump_target  = dump_target
+        self._pre_staging_pose = staging_pose
+        if dump_target:
+            grid.reserve(*dump_target)
+        self._mark_dump_corridor(grid, self._pre_path)
+
+    def cancel_preload(self, grid):
+        """Discard a pre-planned path (e.g. it became invalid). Frees all reservations."""
+        if self._pre_dump_target:
+            grid.unreserve(*self._pre_dump_target)
+            self._pre_dump_target = None
+        self._clear_dump_corridor(grid)
+        self._pre_path         = None
+        self._pre_staging_pose = None
+
     def set_path(self, path, dump_target, grid, staging_pose=None):
         self.path        = list(path)   # copy the path so mutations outside don't affect us
         self.dump_target = dump_target  # remember which cell we're filling this trip
@@ -184,6 +269,7 @@ class Truck:
             if self.dump_target:
                 grid.unreserve(*self.dump_target)  # release the cell reservation so another truck can use it
                 self.dump_target = None             # clear the target reference
+            self._clear_dump_corridor(grid)
             self.status = self.STATUS_IDLE          # stay idle — nothing to do
             return
 
@@ -191,23 +277,72 @@ class Truck:
         self.status = self.STATUS_NAVIGATING  # begin driving toward the dump position
         if dump_target:
             grid.reserve(*dump_target)  # mark the target cell as reserved so other trucks don't also plan to dump there
+        self._mark_dump_corridor(grid, self.path)
 
-    def set_exit_path(self, exit_path):
+    def set_exit_path(self, exit_path, grid):
         if exit_path:  # only switch state if a valid exit path was found
             self._exit_path = list(exit_path)      # store a copy of the exit waypoints
             self.status     = self.STATUS_EXITING  # truck will start following the exit path next tick
+            # Exit corridors are NOT marked PATH_RESERVED — all exits converge to the
+            # same entry point and marking them would block other trucks from reaching it.
+            # CBS space-time constraints handle temporal separation between exiting trucks.
         else:
             # CBS returned an empty path — leave status as EXITING so the main loop retries next tick.
-            # The pathfinder's extended bulldozer (which forces a multi-cell radius around the truck
-            # to be driveable) should prevent this from happening in practice.
             pass
 
     def step(self, grid):
-        print(f"Truck {self.id}: {self.status} | exit_path_len: {len(self._exit_path)}")
-        if self.status != 'IDLE':
-            print(f"DEBUG: Truck {self.id} Status: {self.status} Pos: {self.pos} Path Len: {len(self.path)}")  # log every active tick for debugging
+        if self.status in (self.STATUS_IDLE, self.STATUS_WAITING):  # nothing to do this tick
+            return
 
-        if self.status == self.STATUS_IDLE:  # nothing to do this tick
+        elif self.status == self.STATUS_ENTERING:
+            ex, ey = ENTRY_POINT
+            dx = ex - self.pos[0]
+            dy = ey - self.pos[1]
+            dist = math.hypot(dx, dy)
+            step = grid.cell_size
+            if dist <= step:
+                self.pos[0], self.pos[1] = ex, ey
+                self.heading = math.pi / 2  # face into the polygon (north)
+                if self._pre_path:
+                    # Consume the pre-planned dump path — skip IDLE entirely
+                    self.path         = self._pre_path
+                    self.dump_target  = self._pre_dump_target
+                    self.staging_pose = self._pre_staging_pose
+                    self.stop_target  = self._pre_path[-1]
+                    self._pre_path         = None
+                    self._pre_dump_target  = None
+                    self._pre_staging_pose = None
+                    self.status = self.STATUS_NAVIGATING
+                else:
+                    self.status = self.STATUS_IDLE
+            else:
+                self.pos[0] += (dx / dist) * step
+                self.pos[1] += (dy / dist) * step
+                self.heading = math.atan2(dy, dx)
+            return
+
+        elif self.status == self.STATUS_LEAVING:
+            # Drive through waypoints: always [ENTRY_POINT, home_pos] so the truck
+            # physically passes through the entry corridor before going outside.
+            if not self._leaving_waypoints:
+                self.status = self.STATUS_WAITING
+                return
+            tx, ty = self._leaving_waypoints[0]
+            dx = tx - self.pos[0]
+            dy = ty - self.pos[1]
+            dist = math.hypot(dx, dy)
+            step = grid.cell_size
+            if dist <= step:
+                self.pos[0], self.pos[1] = tx, ty
+                self.heading = math.atan2(dy, dx) if dist > 1e-9 else self.heading
+                self._leaving_waypoints.pop(0)
+                if not self._leaving_waypoints:
+                    self.heading = math.pi / 2  # face inward when parked outside
+                    self.status  = self.STATUS_WAITING
+            else:
+                self.pos[0] += (dx / dist) * step
+                self.pos[1] += (dy / dist) * step
+                self.heading = math.atan2(dy, dx)
             return
 
         elif self.status == self.STATUS_NAVIGATING:
@@ -227,11 +362,13 @@ class Truck:
                         dr, dc = self.dump_target
                         dtx, dty = grid.cell_to_world(dr, dc)
                         self.heading = np.arctan2(self.pos[1] - dty, self.pos[0] - dtx)  # face away from dump cell (truck will reverse into it)
+                    self._clear_dump_corridor(grid)   # path consumed — release corridor for others
                     self.status = self.STATUS_REVERSING  # trigger the one-tick reversing state
                 else:  # path ran out but we didn't reach the stop — something went wrong
                     if self.dump_target:
                         grid.unreserve(*self.dump_target)  # free the reservation so the cell isn't permanently locked
                         self.dump_target = None
+                    self._clear_dump_corridor(grid)
                     self.status = self.STATUS_IDLE  # fall back to idle; the assignment loop will try again
 
         elif self.status == self.STATUS_REVERSING:
@@ -251,11 +388,17 @@ class Truck:
             next_x = self.pos[0] - math.cos(self.heading) * REVERSE_DUMP_STEP_M
             next_y = self.pos[1] - math.sin(self.heading) * REVERSE_DUMP_STEP_M
             if is_pose_driveable(grid, self, next_x, next_y, self.heading):
+                self._reverse_stuck = 0
                 self.pos[0], self.pos[1] = next_x, next_y
                 r, c = grid.world_to_cell(next_x, next_y)
                 grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
             else:
-                print(f"[STAGING] Truck {self.id}: reverse segment unexpectedly blocked")
+                self._reverse_stuck += 1
+                if self._reverse_stuck >= 5:
+                    # Terrain blocked reverse for 5 consecutive steps — dump in place
+                    self._reverse_stuck = 0
+                    self.status      = self.STATUS_DUMPING
+                    self._dump_ticks = 0
 
         elif self.status == self.STATUS_DUMPING:
             self._dump_ticks += 1  # count this tick toward the required dump duration
@@ -279,9 +422,9 @@ class Truck:
                 r, c = grid.world_to_cell(tx, ty)
                 grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
 
-                if not self._exit_path:                # just consumed the last waypoint — path complete
-                    self.pos         = list(ENTRY_POINT)
-                    self.status      = self.STATUS_IDLE
+                if not self._exit_path:                # CBS exit path done — drive through corridor and out
+                    self._leaving_waypoints = [tuple(ENTRY_POINT), tuple(self.home_pos)]
+                    self.status      = self.STATUS_LEAVING
                     self.path        = []
                     self.dump_target = None
                     self.stop_target = None
@@ -292,6 +435,11 @@ class Truck:
         return (self.status == self.STATUS_EXITING
                 and not self._exit_path
                 and self.dump_target is None)
+
+    def release(self):
+        """Move truck from WAITING to ENTERING so it drives to the entry point."""
+        if self.status == self.STATUS_WAITING:
+            self.status = self.STATUS_ENTERING
 
     def is_idle(self):
         return self.status == self.STATUS_IDLE  # convenience predicate used by the assignment loop

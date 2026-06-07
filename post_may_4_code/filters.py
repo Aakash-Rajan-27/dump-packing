@@ -40,7 +40,7 @@ from config import (CELL_SIZE, ENTRY_POINT, DRIVE_CLEARANCE_M,
                     TARGET_PILE_HEIGHT, POSE_HEADING_BUCKETS,
                     STAGING_FOOTPRINT_MARGIN_M)
 
-_BLOCKED = (CellState.BOUNDARY, CellState.FILLED, CellState.OBSTACLE)
+_BLOCKED = (CellState.BOUNDARY, CellState.FILLED, CellState.OBSTACLE, CellState.PATH_RESERVED)
 _BRIDGE_RISK_BLOCKED = (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE)
 
 _HEADING_ANGLES = [
@@ -105,7 +105,13 @@ def dump_accessibility_ok(grid, candidates, truck):
     return fits
 
 
-def make_driveable_mask(grid, truck):
+def make_driveable_mask(grid, truck, ignore_path_reserved=False):
+    """Build a [rows, cols, heading_buckets] boolean passability mask.
+
+    ignore_path_reserved: when True, PATH_RESERVED cells are treated as
+    passable — used for exit-path planning so active dump corridors don't
+    cut off the route back to the entry gate.
+    """
     half_w  = truck.width  / 2.0
     half_l  = truck.length / 2.0
     offsets = _build_corner_offsets(half_w, half_l)
@@ -114,21 +120,23 @@ def make_driveable_mask(grid, truck):
     mask              = np.zeros((rows, cols, POSE_HEADING_BUCKETS), dtype=bool)
     max_escape_height = DRIVE_CLEARANCE_M + 0.5  # forgiveness buffer so trucks can escape shallow pile edges
 
-    # ── VECTORIZED base_ok ───────────────────────────────────────────────────────
-    # Was: Python double loop (8100 iterations calling per-cell checks).
-    # Now: two numpy boolean masks combined in one expression — ~100× faster.
-    base_ok = (~np.isin(grid.state, list(_BLOCKED))) & (grid.z_height <= max_escape_height)
+    blocked_for_base = list(_BLOCKED)
+    if ignore_path_reserved and CellState.PATH_RESERVED in blocked_for_base:
+        blocked_for_base = [s for s in blocked_for_base if s != CellState.PATH_RESERVED]
 
-    rows_arr, cols_arr = np.where(base_ok)  # row/col indices of all passable cells as flat arrays
+    base_ok = (~np.isin(grid.state, blocked_for_base)) & (grid.z_height <= max_escape_height)
+
+    rows_arr, cols_arr = np.where(base_ok)
     if len(rows_arr) == 0:
         return mask
 
-    # ── VECTORIZED centre computation ────────────────────────────────────────────
-    # Was: list comprehension calling cell_to_world() ~8100 times then np.array() conversion.
-    # Now: direct vectorised arithmetic on the index arrays — same result, no Python loop.
     ex, ey     = ENTRY_POINT
     centres_x  = grid.origin[0] + cols_arr * grid.cell_size + grid.cell_size / 2
     centres_y  = grid.origin[1] + rows_arr * grid.cell_size + grid.cell_size / 2
+
+    corner_blocked_states = [CellState.FILLED, CellState.OBSTACLE]
+    if not ignore_path_reserved:
+        corner_blocked_states.append(CellState.PATH_RESERVED)
 
     for hi in range(POSE_HEADING_BUCKETS):
         heading_fits = np.ones(len(rows_arr), dtype=bool)
@@ -142,16 +150,12 @@ def make_driveable_mask(grid, truck):
 
             corner_state  = grid.state[c_row, c_col]
             corner_z      = grid.z_height[c_row, c_col]
-            dist_to_entry = np.hypot(corner_x - ex, corner_y - ey)
 
-            is_blocked  = np.isin(corner_state, [CellState.FILLED, CellState.OBSTACLE]) | (corner_z > max_escape_height)
-            is_boundary = (corner_state == CellState.BOUNDARY) & (dist_to_entry > 15.0)
+            is_blocked  = np.isin(corner_state, corner_blocked_states) | (corner_z > max_escape_height)
+            is_boundary = (corner_state == CellState.BOUNDARY)
 
             heading_fits &= ~(is_blocked | is_boundary)
 
-        # ── VECTORIZED mask assignment ───────────────────────────────────────────
-        # Was: Python loop `for i, (r, c) in enumerate(candidate_cells)` (~64 800 iterations across 8 headings).
-        # Now: boolean fancy indexing — writes all valid cells for this heading in one C-level operation.
         mask[rows_arr[heading_fits], cols_arr[heading_fits], hi] = True
 
     return mask
@@ -172,7 +176,7 @@ def is_pose_driveable(grid, truck, x, y, heading, margin_m=None):
             if not shapely.contains_xy(grid.polygon, corner_x, corner_y):
                 return False
             r, c = grid.world_to_cell(corner_x, corner_y)
-            if grid.state[r, c] in (CellState.FILLED, CellState.OBSTACLE):
+            if grid.state[r, c] in (CellState.FILLED, CellState.OBSTACLE, CellState.PATH_RESERVED):
                 return False
             if grid.z_height[r, c] > DRIVE_CLEARANCE_M + 0.5:
                 return False
@@ -247,7 +251,8 @@ def get_raw_candidates(grid, truck):
     # Was: Python double loop calling is_dumpable() on every cell (~8100 iterations).
     # Now: one numpy boolean expression — mirrors is_dumpable() exactly but runs in C.
     _not_dumpable_states = (CellState.BOUNDARY, CellState.PROTECTED,
-                            CellState.OBSTACLE, CellState.FILLED, CellState.RESERVED)
+                            CellState.OBSTACLE, CellState.FILLED, CellState.RESERVED,
+                            CellState.PATH_RESERVED)
     dumpable = (~np.isin(grid.state, list(_not_dumpable_states)) &
                 (grid.z_height < TARGET_PILE_HEIGHT))
 

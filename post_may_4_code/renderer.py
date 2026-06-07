@@ -11,13 +11,14 @@ from grid_map import CellState
 from config import TARGET_PILE_HEIGHT, _TAN_REPOSE
 
 CELL_COLOURS = {
-    CellState.BOUNDARY:  ( 30,  30,  30),
-    CellState.EMPTY:     (140, 190, 140),
-    CellState.PARTIAL:   (200, 140,  60),
-    CellState.FILLED:    (110,  70,  30),
-    CellState.RESERVED:  (230, 180,  50),
-    CellState.PROTECTED: ( 80, 120, 200),
-    CellState.OBSTACLE:  (200,  50,  50),
+    CellState.BOUNDARY:      ( 30,  30,  30),
+    CellState.EMPTY:         (140, 190, 140),
+    CellState.PARTIAL:       (200, 140,  60),
+    CellState.FILLED:        (110,  70,  30),
+    CellState.RESERVED:      (230, 180,  50),
+    CellState.PROTECTED:     ( 80, 120, 200),
+    CellState.OBSTACLE:      (200,  50,  50),
+    CellState.PATH_RESERVED: (160,  90, 220),  # purple: active path corridor
 }
 
 PANEL_W  = 280
@@ -83,12 +84,72 @@ class Renderer:
         if trucks  is None: trucks  = []
         if metrics is None: metrics = {}
         self._draw_grid()
+        self._draw_paths(trucks)       # planned-path overlay (under trucks)
         self._draw_dump_radii(trucks)
         for truck in trucks:
             self._draw_truck(truck)
         self.screen.blit(self.grid_surface, (0, 0))
         self._draw_panel(metrics, trucks)
         pygame.display.flip()
+
+    def _draw_paths(self, trucks):
+        """
+        Draw each truck's remaining planned path as a light polyline.
+        NAVIGATING trucks show dump path; EXITING trucks show exit path.
+        Sampled every STRIDE waypoints so it's O(path_len / STRIDE) — cheap.
+        No alpha surfaces: just a pastel version of the truck's own colour.
+        Does NOT touch grid state or any simulation data.
+        """
+        STRIDE = 8   # sample 1 point per STRIDE waypoints (~25 pts for a 200-wp path)
+        DOT_R  = max(1, self.scale // 3)
+
+        for truck in trucks:
+            if truck.status == truck.STATUS_NAVIGATING and truck.path:
+                waypoints = truck.path
+            elif truck.status == truck.STATUS_EXITING and truck._exit_path:
+                waypoints = truck._exit_path
+            else:
+                continue
+
+            if not waypoints:
+                continue
+
+            # Pastel: blend 35% truck colour + 65% white so it's clearly lighter
+            r, g, b = truck.colour
+            light = (
+                min(255, int(r * 0.35 + 255 * 0.65)),
+                min(255, int(g * 0.35 + 255 * 0.65)),
+                min(255, int(b * 0.35 + 255 * 0.65)),
+            )
+
+            # Build sampled pixel-coord list
+            half_len = truck.length / 2.0
+            px_points = []
+
+            indices = list(range(0, len(waypoints), STRIDE))
+            if indices[-1] != len(waypoints) - 1:
+                indices.append(len(waypoints) - 1)   # always include last point
+
+            for i in indices:
+                wp = waypoints[i]
+                if len(wp) == 3 and not isinstance(wp[0], (int, np.integer)):
+                    # smooth pose: (rear_x, rear_y, heading)
+                    rx, ry, heading = wp
+                    bx = rx + math.cos(heading) * half_len
+                    by = ry + math.sin(heading) * half_len
+                else:
+                    # cell waypoint: (r, c)
+                    bx, by = self.grid.cell_to_world(int(wp[0]), int(wp[1]))
+                px_points.append(self.world_to_px(bx, by))
+
+            if len(px_points) < 2:
+                continue
+
+            # Thin connecting line
+            pygame.draw.lines(self.grid_surface, light, False, px_points, 1)
+            # Small dot at each sample point so path is visible at low zoom
+            for px, py in px_points:
+                pygame.draw.circle(self.grid_surface, light, (px, py), DOT_R)
 
     def _draw_grid(self):
         # THE FIX: Wipe the canvas clean every frame to stop ghost trails
@@ -265,11 +326,12 @@ class Renderer:
         self.screen.blit(legend_title,(panel_x+8,y)); y += 16
 
         for state, name in [
-            (CellState.EMPTY,    "Empty"),
-            (CellState.PARTIAL,  "Partial pile"),
-            (CellState.FILLED,   "Full pile"),
-            (CellState.RESERVED, "Reserved"),
-            (CellState.PROTECTED,"Entry corridor"),
+            (CellState.EMPTY,         "Empty"),
+            (CellState.PARTIAL,       "Partial pile"),
+            (CellState.FILLED,        "Full pile"),
+            (CellState.RESERVED,      "Reserved"),
+            (CellState.PROTECTED,     "Entry corridor"),
+            (CellState.PATH_RESERVED, "Path corridor"),
         ]:
             col = CELL_COLOURS[state]
             pygame.draw.rect(self.screen, col,(panel_x+8,y+2,10,10))
