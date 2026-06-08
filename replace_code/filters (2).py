@@ -40,8 +40,7 @@ from config import (CELL_SIZE, ENTRY_POINT, DRIVE_CLEARANCE_M,
                     TARGET_PILE_HEIGHT, POSE_HEADING_BUCKETS,
                     STAGING_FOOTPRINT_MARGIN_M)
 
-_BLOCKED = (CellState.BOUNDARY, CellState.FILLED, CellState.OBSTACLE,
-            CellState.RESERVED, CellState.PATH_RESERVED)
+_BLOCKED = (CellState.BOUNDARY, CellState.FILLED, CellState.OBSTACLE, CellState.PATH_RESERVED)
 _BRIDGE_RISK_BLOCKED = (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE)
 
 _HEADING_ANGLES = [
@@ -125,11 +124,7 @@ def make_driveable_mask(grid, truck, ignore_path_reserved=False):
     if ignore_path_reserved and CellState.PATH_RESERVED in blocked_for_base:
         blocked_for_base = [s for s in blocked_for_base if s != CellState.PATH_RESERVED]
 
-    reserved_obstacles = grid.reserved_obstacle_mask(
-        extra_radius_m=max(half_w, half_l))
-    base_ok = ((~np.isin(grid.state, blocked_for_base))
-               & (~reserved_obstacles)
-               & (grid.z_height <= max_escape_height))
+    base_ok = (~np.isin(grid.state, blocked_for_base)) & (grid.z_height <= max_escape_height)
 
     rows_arr, cols_arr = np.where(base_ok)
     if len(rows_arr) == 0:
@@ -139,7 +134,7 @@ def make_driveable_mask(grid, truck, ignore_path_reserved=False):
     centres_x  = grid.origin[0] + cols_arr * grid.cell_size + grid.cell_size / 2
     centres_y  = grid.origin[1] + rows_arr * grid.cell_size + grid.cell_size / 2
 
-    corner_blocked_states = [CellState.FILLED, CellState.OBSTACLE, CellState.RESERVED]
+    corner_blocked_states = [CellState.FILLED, CellState.OBSTACLE]
     if not ignore_path_reserved:
         corner_blocked_states.append(CellState.PATH_RESERVED)
 
@@ -156,10 +151,7 @@ def make_driveable_mask(grid, truck, ignore_path_reserved=False):
             corner_state  = grid.state[c_row, c_col]
             corner_z      = grid.z_height[c_row, c_col]
 
-            corner_reserved = reserved_obstacles[c_row, c_col]
-            is_blocked  = (np.isin(corner_state, corner_blocked_states)
-                           | corner_reserved
-                           | (corner_z > max_escape_height))
+            is_blocked  = np.isin(corner_state, corner_blocked_states) | (corner_z > max_escape_height)
             is_boundary = (corner_state == CellState.BOUNDARY)
 
             heading_fits &= ~(is_blocked | is_boundary)
@@ -176,11 +168,6 @@ def is_pose_driveable(grid, truck, x, y, heading, margin_m=None):
     half_l = truck.length / 2.0 + margin
     hx, hy = np.cos(heading), np.sin(heading)
     sx, sy = -hy, hx
-    reserved_obstacles = grid.reserved_obstacle_mask(
-        extra_radius_m=max(half_w, half_l))
-    center_r, center_c = grid.world_to_cell(x, y)
-    if reserved_obstacles[center_r, center_c]:
-        return False
 
     for ls in (-1, 1):
         for ws in (-1, 1):
@@ -189,9 +176,7 @@ def is_pose_driveable(grid, truck, x, y, heading, margin_m=None):
             if not shapely.contains_xy(grid.polygon, corner_x, corner_y):
                 return False
             r, c = grid.world_to_cell(corner_x, corner_y)
-            if (grid.state[r, c] in (CellState.FILLED, CellState.OBSTACLE,
-                                     CellState.RESERVED, CellState.PATH_RESERVED)
-                    or reserved_obstacles[r, c]):
+            if grid.state[r, c] in (CellState.FILLED, CellState.OBSTACLE, CellState.PATH_RESERVED):
                 return False
             if grid.z_height[r, c] > DRIVE_CLEARANCE_M + 0.5:
                 return False

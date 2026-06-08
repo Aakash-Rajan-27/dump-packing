@@ -75,9 +75,6 @@ class GridMap:
         self.pheromone = np.ones ((self.rows, self.cols), dtype=np.float32)
 
         self._path_corridors: dict = {}  # key -> list of (r, c, original_state)
-        self._path_corridor_counts = {}
-        self._path_corridor_base = {}
-        self._reserved_obstacles = {}
 
         self._classify_cells()
         self._mark_entry_corridor()
@@ -130,25 +127,15 @@ class GridMap:
                         continue
                     seen.add((nr, nc))
                     orig = int(self.state[nr, nc])
-                    if orig in self._CORRIDOR_RESTORABLE or orig == CellState.PATH_RESERVED:
+                    if orig in self._CORRIDOR_RESTORABLE:
                         saved.append((nr, nc, orig))
-                        if (nr, nc) not in self._path_corridor_counts:
-                            self._path_corridor_base[(nr, nc)] = orig
-                        self._path_corridor_counts[(nr, nc)] = (
-                            self._path_corridor_counts.get((nr, nc), 0) + 1)
                         self.state[nr, nc] = CellState.PATH_RESERVED
         self._path_corridors[key] = saved
 
     def clear_path_corridor(self, key):
         """Restore cells that were marked PATH_RESERVED under this key.
         Safe to call even if the key was never registered."""
-        for r, c, _orig in self._path_corridors.pop(key, []):
-            count = self._path_corridor_counts.get((r, c), 0) - 1
-            if count > 0:
-                self._path_corridor_counts[(r, c)] = count
-                continue
-            self._path_corridor_counts.pop((r, c), None)
-            orig = self._path_corridor_base.pop((r, c), CellState.EMPTY)
+        for r, c, orig in self._path_corridors.pop(key, []):
             if self.state[r, c] == CellState.PATH_RESERVED:
                 self.state[r, c] = orig
                 self._update_state(r, c)  # reclassify from z_height if EMPTY/PARTIAL
@@ -266,33 +253,13 @@ class GridMap:
         else:
             self.state[r, c] = CellState.EMPTY
 
-    def reserve(self, r, c, radius_m=0.0):
+    def reserve(self, r, c):
         if self.state[r, c] in (CellState.EMPTY, CellState.PARTIAL):
             self.state[r, c] = CellState.RESERVED
-        self._reserved_obstacles[(r, c)] = max(0.0, float(radius_m))
 
     def unreserve(self, r, c):
-        self._reserved_obstacles.pop((r, c), None)
         if self.state[r, c] == CellState.RESERVED:
             self._update_state(r, c)
-
-    def reserved_obstacle_mask(self, extra_radius_m=0.0):
-        mask = np.zeros((self.rows, self.cols), dtype=bool)
-        for (r, c), radius_m in self._reserved_obstacles.items():
-            total_radius_cells = (radius_m + extra_radius_m) / self.cell_size
-            rad = int(math.ceil(total_radius_cells))
-            rmin = max(0, r - rad)
-            rmax = min(self.rows, r + rad + 1)
-            cmin = max(0, c - rad)
-            cmax = min(self.cols, c + rad + 1)
-            if rmin >= rmax or cmin >= cmax:
-                continue
-            rr = np.arange(rmin, rmax)
-            cc = np.arange(cmin, cmax)
-            RR, CC = np.meshgrid(rr, cc, indexing='ij')
-            dist = np.hypot(RR - r, CC - c)
-            mask[rmin:rmax, cmin:cmax] |= (dist <= total_radius_cells)
-        return mask
 
     def is_dumpable(self, r, c):
         if self.state[r, c] in (CellState.BOUNDARY, CellState.PROTECTED,
