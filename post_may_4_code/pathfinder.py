@@ -81,6 +81,65 @@ def generate_reverse_retreat(truck, grid, num_steps=6):
     return retreat
 
 
+def generate_yield_maneuver(truck, grid, other_truck, num_reverse=5, num_turn=12):
+    """
+    Yield maneuver for head-on (headlock) deadlocks.
+
+    Phase 1 — reverse straight to open clearance between the trucks.
+    Phase 2 — turn ~90° away from the blocker while advancing, so the
+              other truck has a clear lane to pass.
+
+    Turn direction chosen so the yielder moves AWAY from the side where
+    the other truck sits, maximising lateral clearance.
+
+    Returns list of (rear_x, rear_y, heading) waypoints, or [] if blocked.
+    """
+    import grid_map as _gm
+    half_len = truck.length / 2.0
+
+    # ── Phase 1: straight reverse ────────────────────────────────────────────
+    retreat = generate_reverse_retreat(truck, grid, num_steps=num_reverse)
+    if not retreat:
+        return []
+
+    # ── Choose turn direction ─────────────────────────────────────────────────
+    # Cross product of truck heading × vector-to-other: positive → other is to
+    # our LEFT → turn right (clockwise, negative sign); negative → turn left.
+    dx = other_truck.pos[0] - truck.pos[0]
+    dy = other_truck.pos[1] - truck.pos[1]
+    cross = math.cos(truck.heading) * dy - math.sin(truck.heading) * dx
+    turn_sign = -1.0 if cross >= 0.0 else 1.0
+
+    # ── Phase 2: forward + 90° turn ──────────────────────────────────────────
+    cur_x, cur_y, cur_h = retreat[-1]
+    d_h = turn_sign * (math.pi / 2.0) / num_turn   # heading increment per step
+    step_m = TRUCK_MOVE_STEP_M
+
+    turn_poses = []
+    for _ in range(num_turn):
+        mid_h = cur_h + d_h / 2.0
+        nx = cur_x + math.cos(mid_h) * step_m
+        ny = cur_y + math.sin(mid_h) * step_m
+        nh = cur_h + d_h
+
+        bx = nx + math.cos(nh) * half_len
+        by = ny + math.sin(nh) * half_len
+        nr, nc = grid.world_to_cell(nx, ny)
+        br, bc = grid.world_to_cell(bx, by)
+        if not (0 <= nr < grid.rows and 0 <= nc < grid.cols):
+            break
+        if not (0 <= br < grid.rows and 0 <= bc < grid.cols):
+            break
+        if grid.state[nr, nc] == _gm.CellState.BOUNDARY:
+            break
+        if grid.state[br, bc] == _gm.CellState.BOUNDARY:
+            break
+        cur_x, cur_y, cur_h = nx, ny, nh
+        turn_poses.append((cur_x, cur_y, cur_h))
+
+    return retreat + turn_poses
+
+
 # Maps each of the 4 cardinal (row, col) step directions to an integer "bucket" index.
 # The driveable mask's third dimension is indexed by this bucket so we can have
 # direction-specific drivability (e.g. a truck can't reverse uphill but can go forward).
@@ -564,11 +623,15 @@ def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_cells=frozense
     ]
 
 
-def plan_staging_paths(grid, assignments, locked_paths=None):
+def plan_staging_paths(grid, assignments, locked_paths=None, max_time=250,
+                       ignore_path_reserved=False):
     """
-    CBS-based staging path planner.
-    Uses hybrid_astar_to_staging_st (space-time bicycle-model A*) as the low-level
-    planner so dump paths have the same vertex/edge conflict resolution as exit paths.
+    CBS-based staging path planner using the bicycle-model A* (hybrid_astar_to_staging_st).
+    Used for both dump paths (navigating trucks) and exit paths (exiting trucks).
+
+    ignore_path_reserved: pass True for exit trucks so they can cross dump corridors
+      spatially — CBS time constraints handle temporal separation instead.
+    max_time: cap on the space-time A* search depth per candidate.
     """
     if not assignments:
         return {}, {}
@@ -591,9 +654,11 @@ def plan_staging_paths(grid, assignments, locked_paths=None):
     mask_cache = {}
     agent_info = {}
     for truck, dump_target in assignments:
-        if truck.truck_class not in mask_cache:
-            mask_cache[truck.truck_class] = make_driveable_mask(grid, truck)
-        driveable  = mask_cache[truck.truck_class]
+        mask_key = (truck.truck_class, ignore_path_reserved)
+        if mask_key not in mask_cache:
+            mask_cache[mask_key] = make_driveable_mask(
+                grid, truck, ignore_path_reserved=ignore_path_reserved)
+        driveable  = mask_cache[mask_key]
         truck_cell = _truck_front_cell(grid, truck)
 
         # Extended bulldozer: force start + 2-cell radius driveable
@@ -626,6 +691,7 @@ def plan_staging_paths(grid, assignments, locked_paths=None):
                 grid, info['truck'], candidate,
                 driveable=info['driveable'],
                 constraints=hard,
+                max_time=max_time,
             )
             if path:
                 return path, candidate
@@ -812,84 +878,91 @@ def plan_paths(grid, assignments, existing_paths=None):
     return paths
 
 def astar_st(driveable, grid, start_rc, goal_rc, truck, constraints,
-             stop_dist_cells=0.0, max_time=250):  # 250 >> max realistic path (~180 cells) + headroom for waits
+             stop_dist_cells=0.0, max_time=250):
     """
     Space-time A* for CBS.
+    State: (r, c, hb, t) — arrival heading bucket included so turn costs are
+    always computed against the actual arrival direction, eliminating zigzag paths.
+    8-connected movement via heading bucket transitions (±1 bucket per step),
+    matching the same scheme used by astar().
     constraints: set of (r, c, t) tuples — forbidden positions at specific timesteps.
     Returns list of (r, c) path nodes; consecutive duplicates mean "wait in place".
     """
-    turn_radius_cells = truck.turn_radius / grid.cell_size  # convert physical turn radius to cell units for the turn penalty formula
+    turn_radius_cells = truck.turn_radius / grid.cell_size
+    rows, cols = driveable.shape[:2]
 
-    rows, cols = driveable.shape[:2]  # grid bounds used for boundary checks below
+    start_hb    = _bucket_from_heading(truck.heading)
+    start_state = (start_rc[0], start_rc[1], start_hb, 0)
 
-    # Heap entries carry time as an extra dimension vs plain A*: (f, g, r, c, t, prev_dr, prev_dc)
-    # t=0 is the current moment; t increments by 1 with every action (move OR wait)
-    open_heap = [(0.0, 0.0, start_rc[0], start_rc[1], 0, None, None)]  # seed with start cell at t=0, zero cost
+    open_heap = [(0.0, 0.0, start_rc[0], start_rc[1], start_hb, 0)]
+    came_from = {}
+    g_cost    = {start_state: 0.0}
 
-    came_from = {}  # maps (r, c, t) → (parent_r, parent_c, parent_t) for path reconstruction after search ends
-    g_cost    = {(start_rc[0], start_rc[1], 0): 0.0}  # best known cost to reach each (r,c,t) state found so far
-
-    closest_node = (start_rc[0], start_rc[1], 0)  # tracks the (r,c,t) state that came closest to the goal — used as a fallback if goal is unreachable
-    min_dist = math.hypot(start_rc[0] - goal_rc[0], start_rc[1] - goal_rc[1])  # Euclidean distance from start to goal; updated as we explore
+    closest_node = start_state
+    min_dist = math.hypot(start_rc[0] - goal_rc[0], start_rc[1] - goal_rc[1])
 
     while open_heap:
-        f, g, r, c, t, prev_dr, prev_dc = heapq.heappop(open_heap)  # expand the cheapest known (r,c,t) state
+        f, g, r, c, hb, t = heapq.heappop(open_heap)
+        state = (r, c, hb, t)
 
-        if t > max_time:  # hard cap on time depth — prevents infinite waits when a truck is permanently blocked by constraints
+        if t > max_time:
             continue
 
-        dist = math.hypot(r - goal_rc[0], c - goal_rc[1])  # Euclidean distance from current cell to goal cell
-
-        if dist < min_dist:  # new closest point to the goal found; save it so we can fall back here if goal is unreachable
+        dist = math.hypot(r - goal_rc[0], c - goal_rc[1])
+        if dist < min_dist:
             min_dist = dist
-            closest_node = (r, c, t)
+            closest_node = state
 
-        if dist <= stop_dist_cells:  # within the stopping radius — truck doesn't need to reach the exact goal cell
-            closest_node = (r, c, t)  # record this as the terminal state for path reconstruction
-            break  # goal reached; stop expanding
+        if dist <= stop_dist_cells:
+            closest_node = state
+            break
 
-        if g > g_cost.get((r, c, t), float('inf')):  # stale heap entry — a cheaper path to this (r,c,t) was already found; skip
+        if g > g_cost.get(state, float('inf')):
             continue
 
-        nt = t + 1  # the timestep of any action taken from the current state
+        nt = t + 1
 
         # ── WAIT ACTION ──────────────────────────────────────────────────────────
-        # Cost is ASTAR_WAIT_COST (> 1.0) so the planner strongly prefers routing
-        # around a conflict (detour) over standing still until it clears.
         if nt <= max_time and (r, c, nt) not in constraints:
+            wait_state = (r, c, hb, nt)
             wait_g = g + ASTAR_WAIT_COST
-            if wait_g < g_cost.get((r, c, nt), float('inf')):  # only update if this is a cheaper way to reach (r,c,nt)
-                g_cost[(r, c, nt)] = wait_g  # record best cost to this state
-                h = abs(r - goal_rc[0]) + abs(c - goal_rc[1])  # Manhattan heuristic; admissible because we can only move 1 cell per step
-                heapq.heappush(open_heap, (wait_g + h, wait_g, r, c, nt, prev_dr, prev_dc))  # push with unchanged direction (truck didn't move)
-                came_from[(r, c, nt)] = (r, c, t)  # parent of the waited state is the same cell one timestep earlier
+            if wait_g < g_cost.get(wait_state, float('inf')):
+                g_cost[wait_state] = wait_g
+                abs_dr = abs(r - goal_rc[0])
+                abs_dc = abs(c - goal_rc[1])
+                h = max(abs_dr, abs_dc) + (math.sqrt(2) - 1) * min(abs_dr, abs_dc)
+                heapq.heappush(open_heap, (wait_g + h, wait_g, r, c, hb, nt))
+                came_from[wait_state] = state
 
-        # ── MOVE ACTIONS (4-connected) ───────────────────────────────────────────
-        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):  # try up, down, left, right
-            nr, nc = r + dr, c + dc  # candidate neighbour cell
-            if not (0 <= nr < rows and 0 <= nc < cols):  # skip cells outside the grid
+        # ── MOVE ACTIONS (8-connected via heading buckets) ───────────────────────
+        for turn in (-1, 0, 1):
+            next_hb    = (hb + turn) % 8
+            dr, dc     = _BUCKET_TO_DIR[next_hb]
+            nr, nc     = r + dr, c + dc
+            if not (0 <= nr < rows and 0 <= nc < cols):
                 continue
-            hb = _heading_bucket(dr, dc)  # which direction-bucket to check in the driveable mask
-            if not driveable[nr, nc, hb]:  # terrain or obstacle prevents driving this direction into this cell
+            if not driveable[nr, nc, next_hb]:
                 continue
-            if nt <= max_time and (nr, nc, nt) not in constraints:  # CBS constraint check: this truck is forbidden here at this time
-                tc    = _turn_cost(prev_dr, prev_dc, dr, dc, turn_radius_cells)  # extra cost if direction changes (penalises zig-zag paths)
-                new_g = g + 1.0 + tc  # total cost: 1 cell step + optional turn penalty
-                if new_g < g_cost.get((nr, nc, nt), float('inf')):  # better path to (nr,nc,nt) found
-                    g_cost[(nr, nc, nt)] = new_g  # update best cost
-                    h = abs(nr - goal_rc[0]) + abs(nc - goal_rc[1])  # Manhattan distance to goal for A* priority
-                    heapq.heappush(open_heap, (new_g + h, new_g, nr, nc, nt, dr, dc))  # push new state to open set
-                    came_from[(nr, nc, nt)] = (r, c, t)  # record that we reached (nr,nc,nt) by moving from (r,c,t)
+            if nt > max_time or (nr, nc, nt) in constraints:
+                continue
+            turn_cost  = 0.0 if turn == 0 else 0.35 * turn_radius_cells
+            move_cost  = math.hypot(dr, dc)   # 1.0 orthogonal, √2 diagonal
+            new_g      = g + move_cost + turn_cost
+            next_state = (nr, nc, next_hb, nt)
+            if new_g < g_cost.get(next_state, float('inf')):
+                g_cost[next_state] = new_g
+                abs_dr = abs(nr - goal_rc[0])
+                abs_dc = abs(nc - goal_rc[1])
+                h = max(abs_dr, abs_dc) + (math.sqrt(2) - 1) * min(abs_dr, abs_dc)
+                heapq.heappush(open_heap, (new_g + h, new_g, nr, nc, next_hb, nt))
+                came_from[next_state] = state
 
-    # ── PATH RECONSTRUCTION ──────────────────────────────────────────────────────
-    # Walk backwards through came_from from the terminal (r,c,t) state to the start.
-    # If the goal was never reached, closest_node gives the nearest point found — same fallback as plain astar().
-    path, cur = [], closest_node  # start reconstruction from the terminal state
-    while cur in came_from:  # keep walking back until we reach the start (which has no parent)
-        path.append((cur[0], cur[1]))  # record only (r,c) — caller doesn't need the time dimension
-        cur = came_from[cur]  # step to parent state
-    path.reverse()  # came_from builds path backwards; reverse to get start→goal order
-    return path  # list of (r,c) tuples; repeated cells represent wait actions
+    path, cur = [], closest_node
+    while cur in came_from:
+        path.append((cur[0], cur[1]))
+        cur = came_from[cur]
+    path.reverse()
+    return path
 
 
 def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
@@ -971,7 +1044,14 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
 
         # ── EDGE (SWAP) CONFLICT CHECK ────────────────────────────────────────────
         # Two trucks passing through each other is physically impossible at any size.
+        # Guards:
+        #   prev_i != prev_j — require trucks at DIFFERENT cells before the swap.
+        #     Without this, two trucks both parked at entry_rc (path-padded) satisfy
+        #     prev_i==curr_j and prev_j==curr_i trivially, causing an infinite CBS loop.
+        #   entry corridor skip — trucks converging at the single exit funnel are
+        #     expected to be close there; flagging it would prevent any exit path.
         if t >= 1:
+            _edge_entry_rc = grid.world_to_cell(*ENTRY_POINT) if grid is not None else None
             n = len(agent_ids)
             for i in range(n):
                 for j in range(i + 1, n):
@@ -980,7 +1060,13 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
                     curr_i = pos_at(paths_dict[ai], t)
                     prev_j = pos_at(paths_dict[aj], t - 1)
                     curr_j = pos_at(paths_dict[aj], t)
-                    if prev_i == curr_j and prev_j == curr_i:
+                    if prev_i == curr_j and prev_j == curr_i and prev_i != prev_j:
+                        # Skip swaps at the entry corridor (funnel point)
+                        if _edge_entry_rc is not None:
+                            di = math.hypot(curr_i[0] - _edge_entry_rc[0], curr_i[1] - _edge_entry_rc[1])
+                            dj = math.hypot(curr_j[0] - _edge_entry_rc[0], curr_j[1] - _edge_entry_rc[1])
+                            if di <= ENTRY_CORRIDOR_CELLS or dj <= ENTRY_CORRIDOR_CELLS:
+                                continue
                         print(f"[CONFLICT] EDGE SWAP: trucks {ai} and {aj} swapped at t={t} "
                               f"— {prev_i}↔{prev_j}")
                         return ('edge', ai, aj,
@@ -1062,7 +1148,7 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
                         driveable[nr, nc, :] = True
 
         if target_rc == entry_rc:
-            stop_dist_cells = 0.0  # plan all the way to the entry cell — no early stop
+            stop_dist_cells = float(ENTRY_CORRIDOR_CELLS)  # stop at the inner corridor edge
         else:
             r_pile_m        = (1.2 * truck.payload_volume_m3 / (math.pi * _TAN_REPOSE)) ** (1 / 3)
             d_clearance     = max(0.0, r_pile_m - (DRIVE_CLEARANCE_M / _TAN_REPOSE))
@@ -1092,10 +1178,56 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         return path
 
     def smooth_paths(coarse_paths):
-        return {
-            aid: interpolate_path_to_truck_states(grid, agent_info[aid]['truck'], path)
-            for aid, path in coarse_paths.items()
-        }
+        """Smooth each coarse cell path with the bicycle model.
+        If the smoother breaks early (boundary check near polygon walls), splice
+        the remaining coarse cells back on so the path always reaches the target.
+        Trucks handle (r, c) waypoints just as well as (rear_x, rear_y, heading) ones."""
+        out = {}
+        for aid, coarse in coarse_paths.items():
+            truck   = agent_info[aid]['truck']
+            info    = agent_info[aid]
+            is_exit = (info['target'] == entry_rc)
+
+            # Exit paths: after dumping, truck.heading points INTO the polygon.
+            # Snap heading toward the first coarse cell so the bicycle smoother
+            # starts facing the right direction instead of arcing forward first.
+            saved_heading = truck.heading
+            if is_exit and coarse:
+                fx, fy = grid.cell_to_world(coarse[0][0], coarse[0][1])
+                dx_h = fx - truck.pos[0]
+                dy_h = fy - truck.pos[1]
+                if math.hypot(dx_h, dy_h) > 1e-9:
+                    truck.heading = math.atan2(dy_h, dx_h)
+
+            smooth = interpolate_path_to_truck_states(grid, truck, coarse)
+            truck.heading = saved_heading  # restore physical heading unconditionally
+
+            if not smooth:
+                out[aid] = coarse
+                continue
+
+            tx, ty = grid.cell_to_world(*info['target'])
+            last   = smooth[-1]
+            half_l = truck.length / 2.0
+            bx     = last[0] + math.cos(last[2]) * half_l
+            by     = last[1] + math.sin(last[2]) * half_l
+
+            if math.hypot(bx - tx, by - ty) > grid.cell_size * 4:
+                if is_exit:
+                    out[aid] = smooth
+                else:
+                    last_rc = grid.world_to_cell(bx, by)
+                    best_d  = float('inf')
+                    splice  = len(coarse)
+                    for i, wp in enumerate(coarse):
+                        d = math.hypot(wp[0] - last_rc[0], wp[1] - last_rc[1])
+                        if d < best_d:
+                            best_d = d
+                            splice = i
+                    out[aid] = smooth + list(coarse[splice + 1:])
+            else:
+                out[aid] = smooth
+        return out
 
     # ── SINGLE-AGENT SHORT-CIRCUIT ────────────────────────────────────────────────
     # One truck: no inter-agent conflict possible — skip CBS tree, one astar_st call.

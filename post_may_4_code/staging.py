@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import math
 
 from config import (
+    ENTRY_POINT,
     REVERSE_DUMP_CLOSE_ENOUGH_M,
     REVERSE_DUMP_STEP_M,
     STAGING_DISTANCE_WEIGHT,
@@ -50,6 +51,8 @@ def score_staging_candidates(grid, truck, dump_target):
     clearance = required_dump_clearance_m(truck)
     staging_radius = clearance + truck.length / 2.0 + STAGING_EXTRA_DISTANCE_M
     candidates = []
+    entry_x, entry_y = ENTRY_POINT
+    entry_dist_dump = math.hypot(dump_x - entry_x, dump_y - entry_y)
 
     for index in range(STAGING_NUM_ANGLES):
         heading = index * 2.0 * math.pi / STAGING_NUM_ANGLES
@@ -64,7 +67,13 @@ def score_staging_candidates(grid, truck, dump_target):
 
         distance = math.hypot(x - truck.pos[0], y - truck.pos[1])
         heading_delta = abs((heading - truck.heading + math.pi) % (2.0 * math.pi) - math.pi)
-        score = STAGING_DISTANCE_WEIGHT * distance + STAGING_HEADING_WEIGHT * heading_delta
+        # Penalise poses that are farther from entry than the dump target itself —
+        # those require driving past the target then reversing back.
+        entry_dist_pose = math.hypot(x - entry_x, y - entry_y)
+        overshoot = max(0.0, entry_dist_pose - entry_dist_dump)
+        score = (STAGING_DISTANCE_WEIGHT * distance
+                 + STAGING_HEADING_WEIGHT * heading_delta
+                 + 0.4 * overshoot)
         candidates.append(StagingPose(x, y, heading, score))
 
     return sorted(candidates, key=lambda candidate: candidate.score)

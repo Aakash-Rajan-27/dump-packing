@@ -216,12 +216,12 @@ class Renderer:
                          (0, 0, l_px, w_px), border_radius=2)
         pygame.draw.rect(truck_surf, (255, 255, 255),
                          (0, 0, l_px, w_px), 1, border_radius=2)
-                         
+
         cab_w = max(3, l_px // 4)
         cab_colour = tuple(max(0, v - 60) for v in truck.colour)
         pygame.draw.rect(truck_surf, cab_colour,
                          (l_px - cab_w, 0, cab_w, w_px), border_radius=1)
-                         
+
         pygame.draw.line(truck_surf, (255, 255, 255),
                          (0, w_px // 2), (l_px, w_px // 2), 1)
 

@@ -65,7 +65,8 @@ import numpy as np  # numerical operations (arctan2, pi)
 import math  # math.hypot for Euclidean distance
 from config import (TRUCK_CLASSES, ENTRY_POINT, _TAN_REPOSE, TRAIL_STRENGTH,
                     TRAIL_RADIUS_M, REVERSE_DUMP_CLOSE_ENOUGH_M,
-                    REVERSE_DUMP_STEP_M)
+                    REVERSE_DUMP_STEP_M, TRUCK_MOVE_STEP_M,
+                    ENTRY_CORRIDOR_CELLS)
 from filters import is_pose_driveable
 from staging import required_dump_clearance_m
 
@@ -118,6 +119,9 @@ class Truck:
         self._leaving_waypoints    = []      # [ENTRY_POINT, home_pos] driven during STATUS_LEAVING
         # Pre-planned dump path for waiting trucks (planned before entering the polygon)
         self._pre_path         = None        # path pre-planned while truck is WAITING
+        # Stagnation tracking for headlock detection
+        self._pos_snapshot        = list(self.pos)  # position at start of last tick
+        self._pos_stagnant_ticks  = 0               # consecutive ticks with < 0.5 m net progress
         self._pre_dump_target  = None        # dump target reserved during pre-planning
         self._pre_staging_pose = None        # staging pose for the pre-planned path
 
@@ -283,9 +287,11 @@ class Truck:
         if exit_path:  # only switch state if a valid exit path was found
             self._exit_path = list(exit_path)      # store a copy of the exit waypoints
             self.status     = self.STATUS_EXITING  # truck will start following the exit path next tick
-            # Exit corridors are NOT marked PATH_RESERVED — all exits converge to the
-            # same entry point and marking them would block other trucks from reaching it.
-            # CBS space-time constraints handle temporal separation between exiting trucks.
+            # Mark exit corridor so navigating dump trucks route around us.
+            # Exit trucks themselves still use ignore_path_reserved=True so they can
+            # reach the entry regardless of other corridors; CBS time constraints
+            # handle temporal separation between simultaneously-exiting trucks.
+            self._mark_exit_corridor(grid, self._exit_path)
         else:
             # CBS returned an empty path — leave status as EXITING so the main loop retries next tick.
             pass
@@ -299,7 +305,7 @@ class Truck:
             dx = ex - self.pos[0]
             dy = ey - self.pos[1]
             dist = math.hypot(dx, dy)
-            step = grid.cell_size
+            step = TRUCK_MOVE_STEP_M
             if dist <= step:
                 self.pos[0], self.pos[1] = ex, ey
                 self.heading = math.pi / 2  # face into the polygon (north)
@@ -331,13 +337,14 @@ class Truck:
             dx = tx - self.pos[0]
             dy = ty - self.pos[1]
             dist = math.hypot(dx, dy)
-            step = grid.cell_size
+            step = TRUCK_MOVE_STEP_M
             if dist <= step:
                 self.pos[0], self.pos[1] = tx, ty
                 self.heading = math.atan2(dy, dx) if dist > 1e-9 else self.heading
                 self._leaving_waypoints.pop(0)
                 if not self._leaving_waypoints:
                     self.heading = math.pi / 2  # face inward when parked outside
+                    self._clear_exit_corridor(grid)  # truck is fully outside — release the corridor
                     self.status  = self.STATUS_WAITING
             else:
                 self.pos[0] += (dx / dist) * step
@@ -422,7 +429,26 @@ class Truck:
                 r, c = grid.world_to_cell(tx, ty)
                 grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
 
-                if not self._exit_path:                # CBS exit path done — drive through corridor and out
+                # As soon as ANY part of the truck touches the entry corridor,
+                # snap to home — check both body centre and front so the trigger
+                # fires even when the smooth path's rear-axle pose stops just
+                # outside the corridor while the front is already inside it.
+                entry_rc = grid.world_to_cell(*ENTRY_POINT)
+                cur_r, cur_c = grid.world_to_cell(self.pos[0], self.pos[1])
+                front_r, front_c = self.front_center_cell(grid)
+                if (math.hypot(cur_r - entry_rc[0], cur_c - entry_rc[1]) <= ENTRY_CORRIDOR_CELLS
+                        or math.hypot(front_r - entry_rc[0], front_c - entry_rc[1]) <= ENTRY_CORRIDOR_CELLS):
+                    self._clear_exit_corridor(grid)
+                    self._exit_path      = []
+                    self.pos[0], self.pos[1] = self.home_pos[0], self.home_pos[1]
+                    self.heading         = math.pi / 2
+                    self.path            = []
+                    self.dump_target     = None
+                    self.stop_target     = None
+                    self.status          = self.STATUS_WAITING
+                    return
+
+                if not self._exit_path:                # path exhausted before reaching corridor (fallback)
                     self._leaving_waypoints = [tuple(ENTRY_POINT), tuple(self.home_pos)]
                     self.status      = self.STATUS_LEAVING
                     self.path        = []
