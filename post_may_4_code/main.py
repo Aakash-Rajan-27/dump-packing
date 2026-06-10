@@ -15,6 +15,7 @@ import math
 import numpy as np
 from scipy.ndimage import gaussian_filter, binary_dilation
 
+
 sys.stdout.reconfigure(encoding='utf-8')
 
 from config import (POLYGON_BOUNDARY, ENTRY_POINT, CELL_SIZE,
@@ -33,7 +34,28 @@ from pathfinder import (plan_staging_paths, plan_paths_cbs,
                         generate_reverse_retreat, generate_yield_maneuver,
                         escape_and_replan_exit)
 from renderer   import Renderer
+import random
 
+def initialise_half_full_dump(grid):
+    """
+    Generate an initial terrain corresponding to roughly 50%
+    packing density using the existing dump physics.
+    """
+
+    target_pack = 0.03
+
+    valid_cells = np.argwhere(
+        (grid.state == grid_map.CellState.EMPTY) |
+        (grid.state == grid_map.CellState.PARTIAL)
+    )
+
+    while grid.pack_pct() < target_pack:
+        r, c = random.choice(valid_cells)
+
+        if grid.is_dumpable(r, c):
+            grid.dump_at(r, c, volume_m3=10.0)
+
+    print(f"Initial terrain generated. Pack density = {100*grid.pack_pct():.1f}%")
 
 def _corridor_cells(grid, path, truck):
     """
@@ -163,13 +185,17 @@ def _try_inplace_replan(ta, tb, grid, entry_rc):
 
     return False
 
-
 def run_simulation():
     print("Initialising grid...")
     grid = grid_map.GridMap(POLYGON_BOUNDARY, CELL_SIZE)
 
-    valid_cells = np.sum(grid.state == grid_map.CellState.EMPTY)
-    print(f"Grid: {grid.rows}x{grid.cols} cells, {valid_cells} valid dump cells")
+    print("Generating initial 50% dump fill...")
+    initialise_half_full_dump(grid)
+
+    valid_cells = np.sum(
+        (grid.state == grid_map.CellState.EMPTY) |
+        (grid.state == grid_map.CellState.PARTIAL)
+    )
 
     entry_rc = grid.world_to_cell(*ENTRY_POINT)
     print(f"Entry point: world{ENTRY_POINT} -> cell{entry_rc}")
