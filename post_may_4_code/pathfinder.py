@@ -385,13 +385,14 @@ def _hybrid_primitive(grid, truck, driveable, x, y, heading, turn):
     d_heading = 0.0 if turn == 0 else turn * heading_step / samples
     poses = []
 
-    for _ in range(samples):
+    for step in range(samples):
         mid_heading = heading + d_heading / 2.0
         x += math.cos(mid_heading) * ds
         y += math.sin(mid_heading) * ds
         heading = (heading + d_heading + math.pi) % (2.0 * math.pi) - math.pi
-        if not _mask_pose_allowed(grid, driveable, x, y, heading):
-            return None
+        if step % 3 == 0 or step == samples - 1:
+            if not _mask_pose_allowed(grid, driveable, x, y, heading):
+                return None
         poses.append((x, y, heading))
     return poses
 
@@ -478,8 +479,9 @@ def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset()
         x = connector_start[0] + ratio * dx
         y = connector_start[1] + ratio * dy
         heading = connector_start[2] + ratio * heading_delta
-        if not _mask_pose_allowed(grid, driveable, x, y, heading):
-            return []
+        if index % 3 == 1 or index == connector_steps:
+            if not _mask_pose_allowed(grid, driveable, x, y, heading):
+                return []
         body_poses.append((x, y, heading))
     half_len = truck.length / 2.0
     return [
@@ -610,8 +612,9 @@ def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_cells=frozense
         cx      = connector_start[0] + ratio * dx
         cy      = connector_start[1] + ratio * dy
         ch      = connector_start[2] + ratio * heading_delta
-        if not _mask_pose_allowed(grid, driveable, cx, cy, ch):
-            return []
+        if index % 3 == 1 or index == connector_steps:
+            if not _mask_pose_allowed(grid, driveable, cx, cy, ch):
+                return []
         body_poses.append((cx, cy, ch))
 
     half_len = truck.length / 2.0
@@ -637,17 +640,23 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=250,
         return {}, {}
 
     # ── LOCKED SPACE-TIME CONSTRAINTS ────────────────────────────────────────────
+    # locked_paths values are (cells, tail_ticks) tuples — see plan_paths_cbs.
     locked_st: set = set()
     if locked_paths:
-        for path in locked_paths.values():
-            cells = _path_cells(grid, path)
+        for path_entry in locked_paths.values():
+            if isinstance(path_entry, tuple):
+                raw_path, tail_ticks = path_entry
+            else:
+                raw_path, tail_ticks = path_entry, LOCKED_PATH_HORIZON
+            cells = _path_cells(grid, raw_path)
             for t, (r, c) in enumerate(cells):
                 if t > LOCKED_PATH_HORIZON:
                     break
                 locked_st.add((r, c, t))
-            if cells:
+            if cells and tail_ticks > 0:
                 fr, fc = cells[min(len(cells) - 1, LOCKED_PATH_HORIZON)]
-                for t in range(len(cells), LOCKED_PATH_HORIZON + 1):
+                end_t = min(len(cells) + tail_ticks, LOCKED_PATH_HORIZON + 1)
+                for t in range(len(cells), end_t):
                     locked_st.add((fr, fc, t))
 
     # ── PER-AGENT SETUP ───────────────────────────────────────────────────────────
@@ -965,19 +974,57 @@ def astar_st(driveable, grid, start_rc, goal_rc, truck, constraints,
     return path
 
 
+def _rect_overlap_2d(cx1, cy1, h1, hl1, hw1, cx2, cy2, h2, hl2, hw2):
+    """Separating-axis theorem overlap test for two oriented rectangles in world space.
+    Returns True when the rectangles overlap (edge-touching counts as overlap)."""
+    cos1, sin1 = math.cos(h1), math.sin(h1)
+    cos2, sin2 = math.cos(h2), math.sin(h2)
+    axes = ((cos1, sin1), (-sin1, cos1), (cos2, sin2), (-sin2, cos2))
+    c1 = [(cx1 + s * hl1 * cos1 + t * hw1 * (-sin1),
+           cy1 + s * hl1 * sin1 + t * hw1 * cos1)
+          for s in (-1, 1) for t in (-1, 1)]
+    c2 = [(cx2 + s * hl2 * cos2 + t * hw2 * (-sin2),
+           cy2 + s * hl2 * sin2 + t * hw2 * cos2)
+          for s in (-1, 1) for t in (-1, 1)]
+    for ax, ay in axes:
+        p1 = [x * ax + y * ay for x, y in c1]
+        p2 = [x * ax + y * ay for x, y in c2]
+        if max(p1) < min(p2) or max(p2) < min(p1):
+            return False
+    return True
+
+
+def _infer_heading_at_t(path, t):
+    """Approximate truck heading at timestep t from the cell-path direction of travel.
+    Heading convention: atan2(Δrow, Δcol) matches the grid's _BUCKET_TO_HEADING mapping."""
+    if not path:
+        return 0.0
+    end = len(path) - 1
+    t0  = min(t, end)
+    # Clamp both neighbour candidates to [0, end] to guard against t >> path length.
+    for t1 in (min(t + 1, end), min(max(t - 1, 0), end)):
+        if t1 == t0:
+            continue
+        dr = path[t1][0] - path[t0][0] if t1 > t0 else path[t0][0] - path[t1][0]
+        dc = path[t1][1] - path[t0][1] if t1 > t0 else path[t0][1] - path[t1][1]
+        if dr or dc:
+            return math.atan2(dr, dc)
+    return 0.0
+
+
 def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
     """
     Scan all agent paths for the earliest vertex or edge conflict.
     Paths are padded: after reaching the end, an agent stays at its final cell.
 
-    When truck_map ({aid: Truck}) and grid are provided, vertex conflicts are
-    detected using each truck's physical footprint (outer edges) rather than
-    exact cell-centre equality.  Two trucks conflict when the distance between
-    their cell centres is less than the sum of their bounding radii
-    (max(length, width)/2 each), converted to cell units.
+    When truck_map ({aid: Truck}) and grid are provided, vertex conflicts use an
+    exact SAT (separating-axis theorem) rectangle overlap test on each truck's
+    oriented bounding box — heading inferred from consecutive path cells.  This
+    avoids the false positives produced by the old bounding-circle approach when
+    trucks travel in adjacent, non-intersecting corridors.
 
     Returns:
-      ('vertex', aid_i, aid_j, ri, ci, rj, cj, t)  — trucks too close at time t;
+      ('vertex', aid_i, aid_j, ri, ci, rj, cj, t)  — truck rectangles overlap at t;
                                                        (ri,ci) is aid_i's cell,
                                                        (rj,cj) is aid_j's cell.
       ('edge',   aid_i, aid_j, r1,c1, r2,c2, t)    — agents swap cells between t-1 and t.
@@ -996,24 +1043,17 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
             return None
         return _state_cell(path[min(t, len(path) - 1)])
 
-    # Pre-compute per-agent bounding radius in cell units.
-    # Uses max(length, width)/2 so the bounding circle covers the full truck body
-    # regardless of heading — conservative but prevents any edge overlap.
-    def _bounding_radius_cells(aid):
-        if truck_map is None or grid is None:
-            return 0.5  # fallback: treat truck as a point (< 1 cell triggers conflict)
-        truck = truck_map.get(aid)
-        if truck is None:
-            return 0.5
-        return max(truck.length, truck.width) / (2.0 * grid.cell_size)
-
-    radius_cache = {aid: _bounding_radius_cells(aid) for aid in agent_ids}
+    entry_rc_local = grid.world_to_cell(*ENTRY_POINT) if grid is not None else None
 
     for t in range(max_t + 1):
 
-        # ── VERTEX CONFLICT CHECK (physical footprint) ────────────────────────────
-        # Collect every agent's position at this timestep, then check each pair.
-        # Two agents conflict when their cell-centre distance < sum of bounding radii.
+        # ── VERTEX CONFLICT CHECK (exact oriented-rectangle SAT) ─────────────────
+        # Infer each truck's heading from consecutive path cells, convert the cell
+        # centre to world coordinates, then run a separating-axis test on the two
+        # oriented rectangles.  Bounding-circle checks fire whenever trucks are
+        # within one truck-length of each other — even in separate corridor lanes —
+        # because length >> width.  SAT uses the actual footprint, so parallel-lane
+        # travel never triggers a false conflict.
         positions = {}
         for aid in agent_ids:
             p = pos_at(paths_dict[aid], t)
@@ -1025,22 +1065,52 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
             for j in range(i + 1, len(aids_present)):
                 ai, aj = aids_present[i], aids_present[j]
                 pi, pj = positions[ai], positions[aj]
-                clearance = radius_cache[ai] + radius_cache[aj]
-                if math.hypot(pi[0] - pj[0], pi[1] - pj[1]) < clearance:
-                    # Skip conflicts inside the entry corridor — trucks funnel through
-                    # a single exit point so proximity there is expected and unresolvable.
-                    entry_rc = None
-                    if grid is not None:
-                        entry_rc = grid.world_to_cell(*ENTRY_POINT)
-                    if entry_rc is not None:
-                        di = math.hypot(pi[0] - entry_rc[0], pi[1] - entry_rc[1])
-                        dj = math.hypot(pj[0] - entry_rc[0], pj[1] - entry_rc[1])
-                        if di <= ENTRY_CORRIDOR_CELLS or dj <= ENTRY_CORRIDOR_CELLS:
+
+                if truck_map is not None and grid is not None:
+                    ti = truck_map.get(ai)
+                    tj = truck_map.get(aj)
+                    if ti is not None and tj is not None:
+                        hi = _infer_heading_at_t(paths_dict[ai], t)
+                        hj = _infer_heading_at_t(paths_dict[aj], t)
+                        wxi, wyi = grid.cell_to_world(pi[0], pi[1])
+                        wxj, wyj = grid.cell_to_world(pj[0], pj[1])
+                        print(ai, pi, math.degrees(hi))
+                        print(aj, pj, math.degrees(hj))
+                        print(ti.length, ti.width)
+                        print(pi)
+                        print(grid.cell_to_world(pi[0], pi[1]))
+                        print("A cell", pi)
+                        print("A world", wxi, wyi)
+
+                        print("B cell", pj)
+                        print("B world", wxj, wyj)
+
+                        print("headings",
+                            math.degrees(hi),
+                            math.degrees(hj))
+                        dist_world = math.hypot(wxi - wxj, wyi - wyj)
+                        print(f"world dist: {dist_world:.2f}  half-lengths: {ti.length/2:.2f} {tj.length/2:.2f}  sum: {ti.length/2 + tj.length/2:.2f}")
+                        if not _rect_overlap_2d(wxi, wyi, hi, ti.length / 2, ti.width / 2,
+                                                wxj, wyj, hj, tj.length / 2, tj.width / 2):
+                            
                             continue
-                    print(f"[CONFLICT] VERTEX: trucks {ai} and {aj} too close at t={t} "
-                          f"— T{ai}@({pi[0]},{pi[1]}) T{aj}@({pj[0]},{pj[1]}) "
-                          f"dist={math.hypot(pi[0]-pj[0],pi[1]-pj[1]):.2f} clearance={clearance:.2f}")
-                    return ('vertex', ai, aj, pi[0], pi[1], pj[0], pj[1], t)
+                    else:
+                        if pi != pj:
+                            continue
+                else:
+                    if pi != pj:
+                        continue
+
+                # Skip conflicts inside the entry corridor — trucks funnel through
+                # a single exit point so proximity there is expected and unresolvable.
+                if entry_rc_local is not None:
+                    di = math.hypot(pi[0] - entry_rc_local[0], pi[1] - entry_rc_local[1])
+                    dj = math.hypot(pj[0] - entry_rc_local[0], pj[1] - entry_rc_local[1])
+                    if di <= ENTRY_CORRIDOR_CELLS or dj <= ENTRY_CORRIDOR_CELLS:
+                        continue
+                print(f"[CONFLICT] VERTEX: trucks {ai} and {aj} rectangles overlap at t={t} "
+                      f"— T{ai}@({pi[0]},{pi[1]}) T{aj}@({pj[0]},{pj[1]})")
+                return ('vertex', ai, aj, pi[0], pi[1], pj[0], pj[1], t)
 
         # ── EDGE (SWAP) CONFLICT CHECK ────────────────────────────────────────────
         # Two trucks passing through each other is physically impossible at any size.
@@ -1050,8 +1120,10 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
         #     prev_i==curr_j and prev_j==curr_i trivially, causing an infinite CBS loop.
         #   entry corridor skip — trucks converging at the single exit funnel are
         #     expected to be close there; flagging it would prevent any exit path.
+        #   SAT physical check — confirm the truck rectangles at both cells actually
+        #     overlap at the midpoint of the swap; filters cell-model artefacts where
+        #     discrete paths cross but the physical bodies never touch.
         if t >= 1:
-            _edge_entry_rc = grid.world_to_cell(*ENTRY_POINT) if grid is not None else None
             n = len(agent_ids)
             for i in range(n):
                 for j in range(i + 1, n):
@@ -1062,11 +1134,29 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
                     curr_j = pos_at(paths_dict[aj], t)
                     if prev_i == curr_j and prev_j == curr_i and prev_i != prev_j:
                         # Skip swaps at the entry corridor (funnel point)
-                        if _edge_entry_rc is not None:
-                            di = math.hypot(curr_i[0] - _edge_entry_rc[0], curr_i[1] - _edge_entry_rc[1])
-                            dj = math.hypot(curr_j[0] - _edge_entry_rc[0], curr_j[1] - _edge_entry_rc[1])
+                        if entry_rc_local is not None:
+                            di = math.hypot(curr_i[0] - entry_rc_local[0], curr_i[1] - entry_rc_local[1])
+                            dj = math.hypot(curr_j[0] - entry_rc_local[0], curr_j[1] - entry_rc_local[1])
                             if di <= ENTRY_CORRIDOR_CELLS or dj <= ENTRY_CORRIDOR_CELLS:
                                 continue
+                        # SAT check at the swap midpoint to reject geometric artefacts
+                        if truck_map is not None and grid is not None:
+                            ti = truck_map.get(ai)
+                            tj = truck_map.get(aj)
+                            if ti is not None and tj is not None:
+                                hi = math.atan2(curr_i[0] - prev_i[0], curr_i[1] - prev_i[1]) if curr_i != prev_i else 0.0
+                                hj = math.atan2(curr_j[0] - prev_j[0], curr_j[1] - prev_j[1]) if curr_j != prev_j else 0.0
+                                wpi = grid.cell_to_world(prev_i[0], prev_i[1])
+                                wci = grid.cell_to_world(curr_i[0], curr_i[1])
+                                wpj = grid.cell_to_world(prev_j[0], prev_j[1])
+                                wcj = grid.cell_to_world(curr_j[0], curr_j[1])
+                                mid_ix = (wpi[0] + wci[0]) / 2
+                                mid_iy = (wpi[1] + wci[1]) / 2
+                                mid_jx = (wpj[0] + wcj[0]) / 2
+                                mid_jy = (wpj[1] + wcj[1]) / 2
+                                if not _rect_overlap_2d(mid_ix, mid_iy, hi, ti.length / 2, ti.width / 2,
+                                                        mid_jx, mid_jy, hj, tj.length / 2, tj.width / 2):
+                                    continue
                         print(f"[CONFLICT] EDGE SWAP: trucks {ai} and {aj} swapped at t={t} "
                               f"— {prev_i}↔{prev_j}")
                         return ('edge', ai, aj,
@@ -1096,27 +1186,27 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
     mask_cache = {}  # cache driveable masks per truck class — expensive to rebuild
 
     # ── BUILD LOCKED SPACE-TIME CONSTRAINTS ─────────────────────────────────────
-    # Convert each already-moving truck's remaining path into (r, c, t) forbidden
-    # states so new paths cannot occupy those cells at those exact timesteps.
-    # Using time-indexed constraints (not spatial soft-costs) guarantees new trucks
-    # wait or detour rather than passing through an active truck.
+    # locked_paths values are (cells, tail_ticks) tuples where tail_ticks is how
+    # many extra timesteps to hold the final cell after the path ends.
+    # tail_ticks=0 means the cell is free immediately (e.g. exiting trucks).
+    # tail_ticks>0 covers the dump duration so planners don't route through a
+    # truck that is still depositing, but release the cell once it drives away.
     locked_st_constraints: set = set()
     if locked_paths:
-        for path in locked_paths.values():
-            cells = _path_cells(grid, path)
-            # Only lock cells within the near-future horizon so newly-planned trucks
-            # are not forced to wait for an entire long path to clear.  Beyond the
-            # horizon the cell is treated as free and the planner routes around it.
+        for path_entry in locked_paths.values():
+            if isinstance(path_entry, tuple):
+                raw_path, tail_ticks = path_entry
+            else:
+                raw_path, tail_ticks = path_entry, LOCKED_PATH_HORIZON
+            cells = _path_cells(grid, raw_path)
             for t, (r, c) in enumerate(cells):
                 if t > LOCKED_PATH_HORIZON:
                     break
                 locked_st_constraints.add((r, c, t))
-            # The locked truck stays at its final cell once its path ends — lock that
-            # cell for all timesteps from path-end up to the horizon so newly-planned
-            # trucks cannot walk through a parked truck.
-            if cells:
+            if cells and tail_ticks > 0:
                 final_r, final_c = cells[min(len(cells) - 1, LOCKED_PATH_HORIZON)]
-                for t in range(len(cells), LOCKED_PATH_HORIZON + 1):
+                end_t = min(len(cells) + tail_ticks, LOCKED_PATH_HORIZON + 1)
+                for t in range(len(cells), end_t):
                     locked_st_constraints.add((final_r, final_c, t))
 
 
@@ -1134,13 +1224,19 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         driveable  = mask_cache[mask_key]
         truck_cell = _truck_front_cell(grid, truck)
 
-        # Extended bulldozer: force start cell + 2-cell Manhattan radius driveable.
-        # After dumping, the pile spreads 1-2 cells and blocks immediate neighbours —
+        # Extended bulldozer: force start cell + radius driveable.
+        # After dumping, the pile spreads and blocks immediate neighbours —
         # this ensures the truck always has at least one valid first step out.
+        # Exit agents use a pile-size radius so they can always escape the mound.
         # BOUNDARY cells are never overridden — they are hard walls in all cases.
-        for dr in range(-2, 3):
-            for dc in range(-2, 3):
-                if abs(dr) + abs(dc) > 2:
+        if is_exit:
+            r_pile_m    = (1.2 * truck.payload_volume_m3 / (math.pi * _TAN_REPOSE)) ** (1 / 3)
+            bulldozer_r = max(2, int(math.ceil(r_pile_m / grid.cell_size)))
+        else:
+            bulldozer_r = 2
+        for dr in range(-bulldozer_r, bulldozer_r + 1):
+            for dc in range(-bulldozer_r, bulldozer_r + 1):
+                if abs(dr) + abs(dc) > bulldozer_r:
                     continue
                 nr, nc = truck_cell[0] + dr, truck_cell[1] + dc
                 if 0 <= nr < grid.rows and 0 <= nc < grid.cols:
@@ -1260,7 +1356,7 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
 
     _nid = 0
     heap = [(init_cost, _nid, init_constraints, init_paths)]
-    MAX_NODES = 200
+    MAX_NODES = 100
 
     for _ in range(MAX_NODES):
         if not heap:
@@ -1301,3 +1397,102 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         _, _, _, best = heap[0]
         return smooth_paths(best)
     return smooth_paths(init_paths)
+
+
+def escape_and_replan_exit(truck, grid, all_trucks, entry_rc):
+    """
+    Fallback exit planner for a truck that CBS could not route out.
+
+    Phase 1 — back up until clear of the pile or other trucks.
+    Phase 2 — replan from the escape endpoint with a fresh driveable mask.
+    Phase 3 — prepend the retreat waypoints to the smoothed A* path.
+    """
+    half_len = truck.length / 2.0
+
+    # ── Phase 1: reverse retreat ──────────────────────────────────────────────
+    retreat = generate_reverse_retreat(truck, grid, num_steps=12)
+
+    trimmed = []
+    for pose in retreat:
+        rx, ry, rh = pose
+        bx = rx + math.cos(rh) * half_len
+        by = ry + math.sin(rh) * half_len
+        # Stop if too close to another truck
+        for other in all_trucks:
+            if other is truck:
+                continue
+            if math.hypot(bx - other.pos[0], by - other.pos[1]) < (truck.length) * 0.5:
+                retreat = trimmed
+                break
+        else:
+            # Stop if body cell z_height has dropped below clearance (pile is behind us)
+            br, bc = grid.world_to_cell(bx, by)
+            if (0 <= br < grid.rows and 0 <= bc < grid.cols
+                    and grid.z_height[br, bc] < DRIVE_CLEARANCE_M):
+                retreat = trimmed
+                break
+            trimmed.append(pose)
+            continue
+        break
+    else:
+        retreat = trimmed
+
+    # Escape endpoint (body centre + heading)
+    if retreat:
+        esc_rx, esc_ry, esc_h = retreat[-1]
+        esc_bx = esc_rx + math.cos(esc_h) * half_len
+        esc_by = esc_ry + math.sin(esc_h) * half_len
+    else:
+        esc_bx, esc_by, esc_h = truck.pos[0], truck.pos[1], truck.heading
+
+    # ── Phase 2: replan from escape endpoint ─────────────────────────────────
+    saved_pos     = list(truck.pos)
+    saved_heading = truck.heading
+    truck.pos     = [esc_bx, esc_by]
+    truck.heading = esc_h
+
+    driveable = make_driveable_mask(grid, truck, ignore_path_reserved=True)
+
+    r_pile_m    = (1.2 * truck.payload_volume_m3 / (math.pi * _TAN_REPOSE)) ** (1 / 3)
+    bulldozer_r = max(2, int(math.ceil(r_pile_m / grid.cell_size)))
+    esc_cell    = _truck_front_cell(grid, truck)
+    for dr in range(-bulldozer_r, bulldozer_r + 1):
+        for dc in range(-bulldozer_r, bulldozer_r + 1):
+            if abs(dr) + abs(dc) > bulldozer_r:
+                continue
+            nr, nc = esc_cell[0] + dr, esc_cell[1] + dc
+            if 0 <= nr < grid.rows and 0 <= nc < grid.cols:
+                if grid.state[nr, nc] != grid_map.CellState.BOUNDARY:
+                    driveable[nr, nc, :] = True
+
+    astar_path = astar_st(driveable, grid, esc_cell, entry_rc, truck,
+                          constraints=frozenset(),
+                          stop_dist_cells=float(ENTRY_CORRIDOR_CELLS),
+                          max_time=500)
+
+    truck.pos     = saved_pos
+    truck.heading = saved_heading
+
+    if not astar_path and not retreat:
+        return []
+
+    # ── Phase 3: assemble path ────────────────────────────────────────────────
+    # Smooth only the A* coarse portion; prepend the already-fine retreat poses.
+    if astar_path:
+        truck.pos     = [esc_bx, esc_by]
+        truck.heading = esc_h
+        # Snap heading toward first coarse cell (mirrors smooth_paths exit logic)
+        fx, fy = grid.cell_to_world(astar_path[0][0], astar_path[0][1])
+        dx_h = fx - esc_bx
+        dy_h = fy - esc_by
+        if math.hypot(dx_h, dy_h) > 1e-9:
+            truck.heading = math.atan2(dy_h, dx_h)
+        smooth_part = interpolate_path_to_truck_states(grid, truck, astar_path)
+        truck.pos     = saved_pos
+        truck.heading = saved_heading
+        if not smooth_part:
+            smooth_part = astar_path
+    else:
+        smooth_part = []
+
+    return retreat + smooth_part

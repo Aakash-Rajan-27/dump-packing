@@ -30,7 +30,8 @@ from mcts       import mcts_select_dump_points
 from assignment import assign
 from pathfinder import (plan_staging_paths, plan_paths_cbs,
                         _detect_first_conflict, _path_cells,
-                        generate_reverse_retreat, generate_yield_maneuver)
+                        generate_reverse_retreat, generate_yield_maneuver,
+                        escape_and_replan_exit)
 from renderer   import Renderer
 
 
@@ -135,7 +136,8 @@ def _try_inplace_replan(ta, tb, grid, entry_rc):
 
     # First try: replan exit truck — clear old corridor, plan, re-mark
     if nav_t.path:
-        locked = {nav_t.id: [nav_t.front_center_cell(grid)] + list(nav_t.path)}
+        locked = {nav_t.id: ([nav_t.front_center_cell(grid)] + list(nav_t.path),
+                              nav_t._dump_ticks_required + 2)}
         exit_t._clear_exit_corridor(grid)
         ep = plan_paths_cbs(grid, [(exit_t, entry_rc)], locked_paths=locked)
         np_exit = ep.get(exit_t.id, [])
@@ -148,7 +150,7 @@ def _try_inplace_replan(ta, tb, grid, entry_rc):
 
     # Second try: replan nav truck around exit truck's existing corridor
     if exit_t._exit_path and nav_t.dump_target:
-        locked = {exit_t.id: [exit_t.front_center_cell(grid)] + list(exit_t._exit_path)}
+        locked = {exit_t.id: ([exit_t.front_center_cell(grid)] + list(exit_t._exit_path), 0)}
         nav_t.clear_all_corridors(grid)
         np, ns = plan_staging_paths(grid, [(nav_t, nav_t.dump_target)], locked_paths=locked)
         np_nav = np.get(nav_t.id, [])
@@ -278,21 +280,19 @@ def run_simulation():
                                     _locked = {}
                                     for _ot in _trucks_inside:
                                         if _ot.status == _ot.STATUS_NAVIGATING and _ot.path:
-                                            # Navigating truck: lock from its current front cell through
-                                            # the rest of its planned dump path.
-                                            _locked[_ot.id] = ([_ot.front_center_cell(grid)]
-                                                               + list(_ot.path))
+                                            _locked[_ot.id] = (
+                                                [_ot.front_center_cell(grid)] + list(_ot.path),
+                                                _ot._dump_ticks_required + 2)
                                         elif _ot.status == _ot.STATUS_EXITING and _ot._exit_path:
-                                            # Exiting truck: lock from its current front cell through
-                                            # the rest of its planned exit path back to entry.
-                                            _locked[_ot.id] = ([_ot.front_center_cell(grid)]
-                                                               + list(_ot._exit_path))
+                                            _locked[_ot.id] = (
+                                                [_ot.front_center_cell(grid)] + list(_ot._exit_path),
+                                                0)
                                         else:
-                                            # DUMPING or REVERSING: truck is stationary at this cell.
-                                            # A single-cell path causes plan_staging_paths to lock
-                                            # that cell for all timesteps up to LOCKED_PATH_HORIZON,
-                                            # so the pre-path must route entirely around it.
-                                            _locked[_ot.id] = [_ot.front_center_cell(grid)]
+                                            # DUMPING or REVERSING: lock only for remaining dump ticks.
+                                            _remaining = max(0, _ot._dump_ticks_required - _ot._dump_ticks)
+                                            _locked[_ot.id] = (
+                                                [_ot.front_center_cell(grid)],
+                                                _remaining + 2)
                                     # ── CORRIDOR-SAFE PLANNING ───────────────────────────
                                     # The driveable mask already blocks PATH_RESERVED cells
                                     # (existing corridors), so the planned path's CENTRELINE
@@ -415,16 +415,14 @@ def run_simulation():
             exit_assignments = [(t, entry_rc) for t in exiting_trucks]
             # Pass the remaining paths of all currently navigating trucks as locked paths
             # so the new exit routes don't cross through them.
-            nav_locked = {t.id: [t.front_center_cell(grid)] + list(t.path)
+            nav_locked = {t.id: ([t.front_center_cell(grid)] + list(t.path),
+                                   t._dump_ticks_required + 2)
                           for t in trucks if t.status == t.STATUS_NAVIGATING and t.path}
             # Also lock the pre-planned entry paths of any waiting/entering trucks.
-            # Exit paths use ignore_path_reserved=True and would otherwise be free
-            # to cross those committed corridors — hard space-time constraints
-            # here force them to route around the incoming truck's planned route.
             for _wt in trucks:
                 if (_wt.status in (_wt.STATUS_WAITING, _wt.STATUS_ENTERING)
                         and _wt._pre_path):
-                    nav_locked[_wt.id] = _wt._pre_path
+                    nav_locked[_wt.id] = (_wt._pre_path, _wt._dump_ticks_required + 2)
 
             # ── PHYSICAL CORRIDOR BUFFER for exit planning ────────────────────────
             # ignore_path_reserved=True makes the driveable mask treat PATH_RESERVED
@@ -476,7 +474,10 @@ def run_simulation():
                     grid.state[_nr, _nc] = _orig_s
 
             for t, _ in exit_assignments:
-                t.set_exit_path(exit_paths.get(t.id, []), grid)
+                ep = exit_paths.get(t.id, [])
+                if not ep:
+                    ep = escape_and_replan_exit(t, grid, trucks, entry_rc)
+                t.set_exit_path(ep, grid)
 
         # Exclude trucks that already have a pre-planned path committed (they'll
         # consume it when they finish ENTERING — no need to re-assign them).
@@ -551,9 +552,11 @@ def run_simulation():
                         if t in being_planned:
                             continue  # this truck IS being planned — don't lock its old path
                         if t.status == t.STATUS_NAVIGATING and t.path:
-                            all_locked[t.id] = [t.front_center_cell(grid)] + list(t.path)
+                            all_locked[t.id] = ([t.front_center_cell(grid)] + list(t.path),
+                                                 t._dump_ticks_required + 2)
                         elif t.status == t.STATUS_EXITING and t._exit_path:
-                            all_locked[t.id] = [t.front_center_cell(grid)] + list(t._exit_path)
+                            all_locked[t.id] = ([t.front_center_cell(grid)] + list(t._exit_path),
+                                                 0)
                     paths, staging_poses = plan_staging_paths(grid, assignments_all, locked_paths=all_locked)
                     for truck, dump_point in assignments_all:
                         truck_path = paths.get(truck.id, [])
@@ -651,7 +654,7 @@ def run_simulation():
                     _ta, _tb = stuck_active[_si], stuck_active[_sj]
                     _d = math.hypot(_ta.pos[0] - _tb.pos[0],
                                     _ta.pos[1] - _tb.pos[1])
-                    if _d >= (_ta.length + _tb.length) * 0.65:
+                    if _d >= (_ta.length + _tb.length) * 0.5:
                         continue   # not directly blocking each other
 
                     _ret_a = generate_reverse_retreat(_ta, grid, num_steps=6)

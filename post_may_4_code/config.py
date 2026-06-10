@@ -106,7 +106,7 @@ TRAIL_RADIUS_M  = 3.0
 # Higher value → planner strongly prefers detours over standing still.
 # Must be > 1.0 to prefer any detour; 4.0 means a 4-cell detour is
 # cheaper than waiting 4 steps.
-ASTAR_WAIT_COST = 4.0
+ASTAR_WAIT_COST = 40.0
 # When locking other trucks' future positions as space-time constraints,
 # only look this many steps ahead. Beyond the horizon the cell is free,
 # forcing the planner to route around near-future conflicts rather than
@@ -122,7 +122,7 @@ W_DISTANCE = 1.0
 W_HEADING  = 0.4
 
 # EARLY PHASE: Massive priority (0.4) on Entry Distance to push trucks to the back.
-WEIGHTS_EARLY = (0, 100, 0, 0, 0, 0)
+WEIGHTS_EARLY = (0, 100, 0, 0, 10, 10)
 
 # MID PHASE: Focus shifts to clustering and filling gaps.
 WEIGHTS_MID   = (0.3, 0.2, 0.2, 0.1, 0.1, 0.1) #the weights are 
