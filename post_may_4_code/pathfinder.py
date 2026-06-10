@@ -974,6 +974,15 @@ def astar_st(driveable, grid, start_rc, goal_rc, truck, constraints,
     return path
 
 
+def _corridor_cell_set(grid, truck_id):
+    """Return the frozenset of (r,c) cells reserved by this truck's path corridors."""
+    cells = set()
+    for key in (f"exit_{truck_id}", f"dump_{truck_id}"):
+        for r, c, _ in grid._path_corridors.get(key, []):
+            cells.add((r, c))
+    return frozenset(cells)
+
+
 def _rect_overlap_2d(cx1, cy1, h1, hl1, hw1, cx2, cy2, h2, hl2, hw2):
     """Separating-axis theorem overlap test for two oriented rectangles in world space.
     Returns True when the rectangles overlap (edge-touching counts as overlap)."""
@@ -1001,7 +1010,17 @@ def _infer_heading_at_t(path, t):
         return 0.0
     end = len(path) - 1
     t0  = min(t, end)
-    # Clamp both neighbour candidates to [0, end] to guard against t >> path length.
+    # Padded timestep: truck has stopped at the final cell.  Both forward/backward
+    # candidates collapse to `end` (skipped by the t1==t0 guard), so the old loop
+    # always returned 0.0 — wrong heading → wrong SAT rectangle → false conflicts.
+    # Fix: use the direction of the last actual step as the parked heading.
+    if t > end:
+        if end > 0:
+            dr = path[end][0] - path[end - 1][0]
+            dc = path[end][1] - path[end - 1][1]
+            if dr or dc:
+                return math.atan2(dr, dc)
+        return 0.0
     for t1 in (min(t + 1, end), min(max(t - 1, 0), end)):
         if t1 == t0:
             continue
@@ -1074,25 +1093,16 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
                         hj = _infer_heading_at_t(paths_dict[aj], t)
                         wxi, wyi = grid.cell_to_world(pi[0], pi[1])
                         wxj, wyj = grid.cell_to_world(pj[0], pj[1])
-                        print(ai, pi, math.degrees(hi))
-                        print(aj, pj, math.degrees(hj))
-                        print(ti.length, ti.width)
-                        print(pi)
-                        print(grid.cell_to_world(pi[0], pi[1]))
-                        print("A cell", pi)
-                        print("A world", wxi, wyi)
-
-                        print("B cell", pj)
-                        print("B world", wxj, wyj)
-
-                        print("headings",
-                            math.degrees(hi),
-                            math.degrees(hj))
-                        dist_world = math.hypot(wxi - wxj, wyi - wyj)
-                        print(f"world dist: {dist_world:.2f}  half-lengths: {ti.length/2:.2f} {tj.length/2:.2f}  sum: {ti.length/2 + tj.length/2:.2f}")
                         if not _rect_overlap_2d(wxi, wyi, hi, ti.length / 2, ti.width / 2,
                                                 wxj, wyj, hj, tj.length / 2, tj.width / 2):
-                            
+                            continue
+                        # SAT says rectangles touch — but if the planned path
+                        # corridors share no cells, the paths never actually cross
+                        # and the overlap is a geometry artefact.  Corridors are
+                        # the planning guarantee; trust them and skip the conflict.
+                        ci = _corridor_cell_set(grid, ti.id)
+                        cj = _corridor_cell_set(grid, tj.id)
+                        if ci and cj and ci.isdisjoint(cj):
                             continue
                     else:
                         if pi != pj:
