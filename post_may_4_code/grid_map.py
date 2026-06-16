@@ -113,8 +113,8 @@ class GridMap:
         Saves original states so clear_path_corridor can restore them.
         key: unique string (e.g. 'dump_0', 'exit_1') per truck/path."""
         half = int(math.ceil(half_w_cells))
-        saved = []
         seen = set()
+        candidates = []
         for (r, c) in body_cells:
             for dr in range(-half, half + 1):
                 for dc in range(-half, half + 1):
@@ -126,10 +126,29 @@ class GridMap:
                     if (nr, nc) in seen:
                         continue
                     seen.add((nr, nc))
-                    orig = int(self.state[nr, nc])
-                    if orig in self._CORRIDOR_RESTORABLE:
-                        saved.append((nr, nc, orig))
-                        self.state[nr, nc] = CellState.PATH_RESERVED
+                    candidates.append((nr, nc))
+
+        if not candidates:
+            self._path_corridors[key] = []
+            return
+
+        # Batch polygon check — only mark cells whose centres are inside the
+        # polygon.  This is the definitive guard: even if body cells reach the
+        # polygon edge, the corridor never extends outside it.
+        cxs = np.array([self.origin[0] + nc * self.cell_size + self.cell_size / 2
+                        for _, nc in candidates])
+        cys = np.array([self.origin[1] + nr * self.cell_size + self.cell_size / 2
+                        for nr, _ in candidates])
+        inside = shapely.contains_xy(self.polygon, cxs, cys)
+
+        saved = []
+        for (nr, nc), ok in zip(candidates, inside):
+            if not ok:
+                continue
+            orig = int(self.state[nr, nc])
+            if orig in self._CORRIDOR_RESTORABLE:
+                saved.append((nr, nc, orig))
+                self.state[nr, nc] = CellState.PATH_RESERVED
         self._path_corridors[key] = saved
 
     def clear_path_corridor(self, key):
@@ -188,7 +207,12 @@ class GridMap:
         jj = np.arange(cmin, cmax)
         II, JJ = np.meshgrid(ii, jj, indexing='ij')
         dist_m = np.hypot(II - r, JJ - c) * self.cell_size
-        cone_mask = (dist_m < r_pile_m) & (self.state[rmin:rmax, cmin:cmax] != CellState.BOUNDARY)
+        _state_slice = self.state[rmin:rmax, cmin:cmax]
+        cone_mask = (dist_m < r_pile_m) & (
+            (_state_slice != CellState.BOUNDARY) &
+            (_state_slice != CellState.PROTECTED) &
+            (_state_slice != CellState.PATH_RESERVED)
+        )
         self.z_height[rmin:rmax, cmin:cmax] += np.where(cone_mask, (r_pile_m - dist_m) * tan_theta, 0.0).astype(np.float32)
 
         max_dz = tan_theta * self.cell_size
@@ -200,13 +224,15 @@ class GridMap:
             changed = False
             for i in range(rx_min, rx_max):
                 for j in range(cx_min, cx_max):
-                    if self.state[i, j] in (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE, CellState.PROTECTED):
+                    if self.state[i, j] in (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE,
+                                              CellState.PROTECTED, CellState.PATH_RESERVED):
                         continue
 
                     for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                         ni, nj = i + di, j + dj
 
-                        if self.state[ni, nj] in (CellState.BOUNDARY, CellState.OBSTACLE, CellState.PROTECTED):
+                        if self.state[ni, nj] in (CellState.BOUNDARY, CellState.OBSTACLE,
+                                                   CellState.PROTECTED, CellState.PATH_RESERVED):
                             continue
 
                         dz = self.z_height[i, j] - self.z_height[ni, nj]

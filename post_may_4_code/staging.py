@@ -27,7 +27,7 @@ def required_dump_clearance_m(truck):
     return max(3.0, pile_radius + 1.0)
 
 
-def reverse_segment_poses(grid, truck, dump_target, staging_pose):
+def reverse_segment_poses(grid, truck, dump_target, staging_pose, ignore_path_reserved=False):
     dump_x, dump_y = grid.cell_to_world(*dump_target)
     clearance = required_dump_clearance_m(truck)
     x, y = staging_pose.x, staging_pose.y
@@ -40,13 +40,14 @@ def reverse_segment_poses(grid, truck, dump_target, staging_pose):
             return poses
         x -= math.cos(staging_pose.heading) * REVERSE_DUMP_STEP_M
         y -= math.sin(staging_pose.heading) * REVERSE_DUMP_STEP_M
-        if not is_pose_driveable(grid, truck, x, y, staging_pose.heading):
+        if not is_pose_driveable(grid, truck, x, y, staging_pose.heading,
+                                  ignore_path_reserved=ignore_path_reserved):
             return None
         poses.append((x, y, staging_pose.heading))
     return None
 
 
-def score_staging_candidates(grid, truck, dump_target):
+def score_staging_candidates(grid, truck, dump_target, ignore_path_reserved=False):
     dump_x, dump_y = grid.cell_to_world(*dump_target)
     clearance = required_dump_clearance_m(truck)
     staging_radius = clearance + truck.length / 2.0 + STAGING_EXTRA_DISTANCE_M
@@ -58,10 +59,12 @@ def score_staging_candidates(grid, truck, dump_target):
         heading = index * 2.0 * math.pi / STAGING_NUM_ANGLES
         x = dump_x + math.cos(heading) * staging_radius
         y = dump_y + math.sin(heading) * staging_radius
-        if not is_pose_driveable(grid, truck, x, y, heading):
+        if not is_pose_driveable(grid, truck, x, y, heading,
+                                  ignore_path_reserved=ignore_path_reserved):
             continue
         candidate = StagingPose(x, y, heading, 0.0)
-        reverse_poses = reverse_segment_poses(grid, truck, dump_target, candidate)
+        reverse_poses = reverse_segment_poses(grid, truck, dump_target, candidate,
+                                              ignore_path_reserved=ignore_path_reserved)
         if reverse_poses is None:
             continue
 

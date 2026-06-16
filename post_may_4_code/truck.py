@@ -427,6 +427,22 @@ class Truck:
                 self.status = self.STATUS_EXITING       # start the return journey
 
         elif self.status == self.STATUS_EXITING:
+            # If already within the entry corridor with no path pending, snap home now
+            # rather than waiting for the planner to produce a trivial one-step path.
+            if not self._exit_path:
+                _entry_rc = grid.world_to_cell(*ENTRY_POINT)
+                _cur_r, _cur_c = grid.world_to_cell(self.pos[0], self.pos[1])
+                _front_r, _front_c = self.front_center_cell(grid)
+                if (math.hypot(_cur_r - _entry_rc[0], _cur_c - _entry_rc[1]) <= ENTRY_CORRIDOR_CELLS
+                        or math.hypot(_front_r - _entry_rc[0], _front_c - _entry_rc[1]) <= ENTRY_CORRIDOR_CELLS):
+                    self._clear_exit_corridor(grid)
+                    self.pos[0], self.pos[1] = self.home_pos[0], self.home_pos[1]
+                    self.heading    = math.pi / 2
+                    self.path       = []
+                    self.dump_target = None
+                    self.stop_target = None
+                    self.status     = self.STATUS_WAITING
+                    return
             if self._exit_path:
                 waypoint = self._exit_path.pop(0)      # consume the next exit waypoint
                 tx, ty, heading = self._waypoint_to_pose(grid, waypoint)
