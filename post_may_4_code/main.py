@@ -34,6 +34,7 @@ from mcts       import mcts_select_dump_points
 from assignment import assign
 from pathfinder import (plan_staging_paths, plan_paths_cbs,
                         _detect_first_conflict, _path_cells,
+                        _corridor_cell_set,
                         generate_reverse_retreat, generate_yield_maneuver,
                         escape_and_replan_exit)
 from renderer   import Renderer
@@ -149,30 +150,13 @@ def _execute_planning_task(task, result_q):
 
     # ── EXIT PATH PLANNING ────────────────────────────────────────────────────
     elif ttype == 'exit':
-        exit_snaps       = task['exit_trucks']     # list[truck_snapshot]
-        locked           = task['locked_paths']
-        pre_path_trucks  = task.get('pre_path_trucks', [])  # list[(snap, hw_cells)]
-
-        # Apply corridor buffer to snapshot so exit planner avoids pre-paths
-        _exit_hw = max((int(math.ceil(t.width / 2.0 / grid_snap.cell_size))
-                        for t in exit_snaps), default=0)
-        for wt_snap, wt_hw in pre_path_trucks:
-            total_r = wt_hw + _exit_hw
-            total_h = int(math.ceil(total_r))
-            for _pr, _pc in _path_cells(grid_snap, wt_snap._pre_path):
-                for dr in range(-total_h, total_h + 1):
-                    for dc in range(-total_h, total_h + 1):
-                        if math.hypot(dr, dc) > total_r:
-                            continue
-                        nr, nc = _pr + dr, _pc + dc
-                        if not (0 <= nr < grid_snap.rows and 0 <= nc < grid_snap.cols):
-                            continue
-                        if math.hypot(nr - entry_rc[0], nc - entry_rc[1]) <= ENTRY_CORRIDOR_CELLS:
-                            continue
-                        s = int(grid_snap.state[nr, nc])
-                        if s not in (int(grid_map.CellState.BOUNDARY),
-                                     int(grid_map.CellState.OBSTACLE)):
-                            grid_snap.state[nr, nc] = grid_map.CellState.OBSTACLE
+        exit_snaps = task['exit_trucks']     # list[truck_snapshot]
+        locked     = task['locked_paths']
+        # pre_path_trucks obstacle-stamping removed: it marked waiting trucks'
+        # incoming corridors as OBSTACLE cells up to 12 cells wide, creating a
+        # solid wall that split the grid and made exit paths impossible to find.
+        # Temporal separation is handled by nav_locked space-time constraints;
+        # spatial separation by PATH_RESERVED corridors + ignore_path_reserved=True.
 
         exit_assignments = [(t_snap, entry_rc) for t_snap in exit_snaps]
         exit_paths       = plan_paths_cbs(grid_snap, exit_assignments,
@@ -597,20 +581,13 @@ def run_simulation():
                         and wt._pre_path):
                     nav_locked[wt.id] = (wt._pre_path, wt._dump_ticks_required + 2)
 
-            pre_snaps = [(_make_truck_snapshot(wt),
-                          wt.width / 2.0 / grid.cell_size)
-                         for wt in trucks
-                         if wt.status in (wt.STATUS_WAITING, wt.STATUS_ENTERING)
-                         and wt._pre_path]
-
             exit_snaps = [_make_truck_snapshot(t) for t in need_exit]
 
             _work_q.put({'type':           'exit',
                          'grid_snap':       g_snap,
                          'entry_rc':        entry_rc,
                          'exit_trucks':     exit_snaps,
-                         'locked_paths':    nav_locked,
-                         'pre_path_trucks': pre_snaps})
+                         'locked_paths':    nav_locked})
             for t in need_exit:
                 _in_flight.add(t.id)
 
@@ -673,6 +650,13 @@ def run_simulation():
                     dist = math.hypot(truck.pos[0] - other.pos[0],
                                       truck.pos[1] - other.pos[1])
                     if dist < (truck.length + other.length) * 0.5:
+                        # If both trucks have non-empty, disjoint path corridors
+                        # their planned paths don't physically cross — bounding-circle
+                        # overlap is a geometry artefact; let both continue.
+                        ci = _corridor_cell_set(grid, truck.id)
+                        cj = _corridor_cell_set(grid, other.id)
+                        if ci and cj and ci.isdisjoint(cj):
+                            continue
                         collided = True
                         break
 

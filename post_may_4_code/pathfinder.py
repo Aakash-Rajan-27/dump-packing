@@ -688,6 +688,10 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
         }
 
     # ── LOW-LEVEL PLANNER ─────────────────────────────────────────────────────────
+    _st_calls   = [0]   # hybrid_astar_to_staging_st calls (expensive, space-time)
+    _spa_calls  = [0]   # hybrid_astar_to_staging calls    (cheap, spatial only)
+    _cbs_nodes  = [0]   # CBS high-level nodes expanded
+
     def _plan_one(aid, cbs_constraints, preferred_pose=None):
         """Plan one truck with combined CBS + locked constraints.
         Tries preferred_pose first, then all scored candidates."""
@@ -696,6 +700,7 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
         ordered = (([preferred_pose] if preferred_pose else []) +
                    [c for c in info['candidates'] if c is not preferred_pose])
         for candidate in ordered:
+            _st_calls[0] += 1
             path = hybrid_astar_to_staging_st(
                 grid, info['truck'], candidate,
                 driveable=info['driveable'],
@@ -707,17 +712,25 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
         print(f"[STAGING] Truck {info['truck'].id}: no reachable staging pose")
         return [], None
 
+    _agent_ids = list(agent_info.keys())
+    _tag = f"T{_agent_ids}" if len(_agent_ids) > 1 else f"T{_agent_ids[0]}"
+
     # ── SINGLE-AGENT SHORT-CIRCUIT ────────────────────────────────────────────────
     if len(agent_info) == 1:
         aid  = next(iter(agent_info))
         info = agent_info[aid]
         for _cand in info['candidates']:
+            _spa_calls[0] += 1
             _p = hybrid_astar_to_staging(grid, info['truck'], _cand,
                                           driveable=info['driveable'])
             if _p:
+                print(f"[STAGING] {_tag}: spatial ok "
+                      f"(spatial_calls={_spa_calls[0]}, st_calls=0, cbs_nodes=0)")
                 return {aid: _p}, {aid: _cand}
         # spatial failed (tight spot) — fall back to ST version
         path, pose = _plan_one(aid, set())
+        print(f"[STAGING] {_tag}: spatial failed → ST fallback "
+              f"(spatial_calls={_spa_calls[0]}, st_calls={_st_calls[0]}, cbs_nodes=0)")
         return {aid: path}, {aid: pose}
 
     # ── SPATIAL-FIRST (APPROACH B) ────────────────────────────────────────────────
@@ -726,6 +739,7 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
     _sp_paths, _sp_staging = {}, {}
     for _aid, _info in agent_info.items():
         for _cand in _info['candidates']:
+            _spa_calls[0] += 1
             _p = hybrid_astar_to_staging(grid, _info['truck'], _cand,
                                           driveable=_info['driveable'])
             if _p:
@@ -738,6 +752,8 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
         # SAT triggers false positives: 8.7×5.5m trucks in 1m cells overlap on adjacent paths.
         # Separate cells = separate PATH_RESERVED corridors = no physical collision in practice.
         if _detect_first_conflict(_sp_cells, truck_map=None, grid=None) is None:
+            print(f"[STAGING] {_tag}: spatial ok, no conflict "
+                  f"(spatial_calls={_spa_calls[0]}, st_calls=0, cbs_nodes=0)")
             return _sp_paths, _sp_staging   # no conflict — skip ST/CBS entirely
     # ─────────────────────────────────────────────────────────────────────────────
 
@@ -760,12 +776,15 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
         if not heap:
             break
         cost, _, constraints, paths, staging = heapq.heappop(heap)
+        _cbs_nodes[0] += 1
 
         # Convert smooth paths → cell sequences for conflict detection
         cell_paths = {aid: _path_cells(grid, p) for aid, p in paths.items() if p}
         conflict   = _detect_first_conflict(cell_paths, truck_map=truck_map, grid=grid)
 
         if conflict is None:
+            print(f"[STAGING] {_tag}: CBS solved "
+                  f"(spatial_calls={_spa_calls[0]}, st_calls={_st_calls[0]}, cbs_nodes={_cbs_nodes[0]})")
             return paths, staging   # conflict-free solution found
 
         if conflict[0] == 'vertex':
@@ -789,6 +808,8 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
             heapq.heappush(heap, (new_cost, _nid, new_cons, new_paths, new_staging))
 
     # CBS exhausted — return best found
+    print(f"[STAGING] {_tag}: CBS exhausted "
+          f"(spatial_calls={_spa_calls[0]}, st_calls={_st_calls[0]}, cbs_nodes={_cbs_nodes[0]})")
     if heap:
         _, _, _, best_paths, best_staging = heap[0]
         return best_paths, best_staging

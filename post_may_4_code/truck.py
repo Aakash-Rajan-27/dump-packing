@@ -360,6 +360,12 @@ class Truck:
                 self.heading = heading
                 r, c = grid.world_to_cell(tx, ty)
                 grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
+                # Shrink dump corridor to only cover the REMAINING path.
+                # Cells already driven through are released so other trucks can
+                # plan through them immediately rather than waiting until arrival.
+                if self.path:
+                    self._mark_dump_corridor(grid, self.path)
+                # (if path is now empty the block below calls _clear_dump_corridor)
 
             if not self.path:  # path just ran out — check whether we reached the intended stop
                 tr, tc = self.front_center_cell(grid)  # path targets the truck's front centre, not its body centre
@@ -428,6 +434,11 @@ class Truck:
                 self.heading = heading
                 r, c = grid.world_to_cell(tx, ty)
                 grid.deposit_trail(r, c, TRAIL_RADIUS_M / grid.cell_size, TRAIL_STRENGTH)
+                # Shrink exit corridor to only the remaining waypoints so cells
+                # already passed are freed for other trucks' planning.
+                if self._exit_path:
+                    self._mark_exit_corridor(grid, self._exit_path)
+                # (if empty the blocks below handle clearing / state transition)
 
                 # As soon as ANY part of the truck touches the entry corridor,
                 # snap to home — check both body centre and front so the trigger

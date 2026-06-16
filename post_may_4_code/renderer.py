@@ -68,8 +68,17 @@ class Renderer:
         self.font_small = pygame.font.SysFont('monospace', 13)
         self.font_tiny  = pygame.font.SysFont('monospace', 11)
 
-        self.grid_surface = pygame.Surface((self.grid_w, self.grid_h))
+        # Stable cell layer — only repainted when cell state/pheromone changes.
+        self.grid_surface   = pygame.Surface((self.grid_w, self.grid_h))
+        # Transient overlay — trucks, paths, dump radii — cleared every frame.
+        self._overlay       = pygame.Surface((self.grid_w, self.grid_h), pygame.SRCALPHA)
         self.m_per_px = grid.cell_size / self.scale
+
+        # Cache: track what was last drawn per cell to skip unchanged ones.
+        self._cache_state     = np.full((grid.rows, grid.cols), -1, dtype=np.int8)
+        self._cache_pheromone = np.full((grid.rows, grid.cols), -1, dtype=np.int8)
+        self._cache_z_quant   = np.full((grid.rows, grid.cols), -1, dtype=np.int8)
+        self._grid_dirty      = True  # force full redraw on first frame
 
     def world_to_px(self, x, y):
         ox, oy = self.grid.origin
@@ -83,12 +92,16 @@ class Renderer:
     def draw(self, trucks=None, metrics=None):
         if trucks  is None: trucks  = []
         if metrics is None: metrics = {}
+        # Cell layer: only repaints dirty/changed cells.
         self._draw_grid()
-        self._draw_paths(trucks)       # planned-path overlay (under trucks)
+        # Overlay: clear and redraw trucks/paths each frame (cheap — no cell loop).
+        self._overlay.fill((0, 0, 0, 0))
+        self._draw_paths(trucks)
         self._draw_dump_radii(trucks)
         for truck in trucks:
             self._draw_truck(truck)
         self.screen.blit(self.grid_surface, (0, 0))
+        self.screen.blit(self._overlay, (0, 0))
         self._draw_panel(metrics, trucks)
         pygame.display.flip()
 
@@ -146,23 +159,32 @@ class Renderer:
                 continue
 
             # Thin connecting line
-            pygame.draw.lines(self.grid_surface, light, False, px_points, 1)
+            pygame.draw.lines(self._overlay, light, False, px_points, 1)
             # Small dot at each sample point so path is visible at low zoom
             for px, py in px_points:
-                pygame.draw.circle(self.grid_surface, light, (px, py), DOT_R)
+                pygame.draw.circle(self._overlay, light, (px, py), DOT_R)
 
     def _draw_grid(self):
-        # THE FIX: Wipe the canvas clean every frame to stop ghost trails
-        self.grid_surface.fill((0, 0, 0))
-
         g = self.grid
         s = self.scale
 
-        z_norm = np.clip(g.z_height / TARGET_PILE_HEIGHT, 0.0, 1.0)
+        z_norm    = np.clip(g.z_height / TARGET_PILE_HEIGHT, 0.0, 1.0)
+        # Quantize z and pheromone so tiny float changes don't trigger redraws.
+        z_quant   = (z_norm * 19).astype(np.int8)            # 0-19
+        ph_quant  = ((1.0 - np.clip(g.pheromone, 0.0, 1.0)) * 19).astype(np.int8)  # 0-19
 
         for r in range(g.rows):
             for c in range(g.cols):
-                state = g.state[r, c]
+                state = int(g.state[r, c])
+                zq    = z_quant[r, c]
+                phq   = ph_quant[r, c]
+
+                # Skip if nothing visible has changed since last draw.
+                if (not self._grid_dirty
+                        and self._cache_state[r, c] == state
+                        and self._cache_z_quant[r, c] == zq
+                        and self._cache_pheromone[r, c] == phq):
+                    continue
 
                 if state == CellState.BOUNDARY:
                     colour = CELL_COLOURS[CellState.BOUNDARY]
@@ -171,21 +193,23 @@ class Renderer:
                 else:
                     colour = CELL_COLOURS.get(state, (50, 50, 50))
 
-                # Pheromone trail tint: cyan-blue overlay, intensity = 1 - pheromone.
-                # Visible on all non-boundary cells; fades out as pheromone recovers to 1.
-                if state != CellState.BOUNDARY:
-                    trail = 1.0 - g.pheromone[r, c]
-                    if trail > 0.01:
-                        colour = (
-                            max(0,   int(colour[0] - trail * 40)),
-                            max(0,   int(colour[1] - trail * 20)),
-                            min(255, int(colour[2] + trail * 80)),
-                        )
+                # Pheromone trail tint: cyan-blue overlay, fades as pheromone recovers.
+                if state != CellState.BOUNDARY and phq > 0:
+                    trail = phq / 19.0
+                    colour = (
+                        max(0,   int(colour[0] - trail * 40)),
+                        max(0,   int(colour[1] - trail * 20)),
+                        min(255, int(colour[2] + trail * 80)),
+                    )
 
-                pygame.draw.rect(
-                    self.grid_surface, colour,
-                    (c * s, r * s, max(1, s - 1), max(1, s - 1))
-                )
+                # Fill full cell with no gap so no gridlines appear.
+                pygame.draw.rect(self.grid_surface, colour, (c * s, r * s, s, s))
+
+                self._cache_state[r, c]     = state
+                self._cache_z_quant[r, c]   = zq
+                self._cache_pheromone[r, c] = phq
+
+        self._grid_dirty = False
 
     def _draw_dump_radii(self, trucks):
         for truck in trucks:
@@ -199,7 +223,7 @@ class Renderer:
                                (cone_r_px+1, cone_r_px+1), cone_r_px)
             pygame.draw.circle(surf, (*truck.colour, 180),
                                (cone_r_px+1, cone_r_px+1), cone_r_px, 2)
-            self.grid_surface.blit(surf, (px-cone_r_px-1, py-cone_r_px-1))
+            self._overlay.blit(surf, (px-cone_r_px-1, py-cone_r_px-1))
 
     def _draw_truck(self, truck):
         w_px_real = self.metres_to_px(truck.width)
@@ -230,7 +254,7 @@ class Renderer:
 
         px, py = self.world_to_px(*truck.pos)
         rect = rotated.get_rect(center=(px, py))
-        self.grid_surface.blit(rotated, rect)
+        self._overlay.blit(rotated, rect)
 
         status_colours = {
             truck.STATUS_IDLE:       (120, 120, 120),
@@ -240,25 +264,25 @@ class Renderer:
         }
         ring_col = status_colours.get(truck.status, (180, 180, 180))
         ring_r   = max(4, w_px // 2 + 2)
-        pygame.draw.circle(self.grid_surface, ring_col, (px, py), ring_r, 2)
+        pygame.draw.circle(self._overlay, ring_col, (px, py), ring_r, 2)
 
         arrow_len = max(8, l_px // 2 + 4)
         tip_x = int(px + arrow_len * math.cos(truck.heading))
         tip_y = int(py + arrow_len * math.sin(truck.heading))
-        pygame.draw.line(self.grid_surface, (255, 255, 255),
+        pygame.draw.line(self._overlay, (255, 255, 255),
                          (px, py), (tip_x, tip_y), 2)
 
         head_len = max(4, arrow_len // 3)
         for angle_offset in (math.pi * 5/6, -math.pi * 5/6):
             hx = int(tip_x + head_len * math.cos(truck.heading + angle_offset))
             hy = int(tip_y + head_len * math.sin(truck.heading + angle_offset))
-            pygame.draw.line(self.grid_surface, (255, 255, 255),
+            pygame.draw.line(self._overlay, (255, 255, 255),
                              (tip_x, tip_y), (hx, hy), 2)
 
         label = self.font_tiny.render(
             f"{truck.label}{truck.id}", True, (255, 255, 255))
-        self.grid_surface.blit(label, (px - label.get_width() // 2,
-                                       py - ring_r - 12))
+        self._overlay.blit(label, (px - label.get_width() // 2,
+                                   py - ring_r - 12))
 
     def _draw_panel(self, metrics, trucks):
         panel_x = self.grid_w
@@ -352,6 +376,11 @@ class Renderer:
                     self.grid_h       = self.grid.rows * self.scale
                     self.m_per_px     = self.grid.cell_size / self.scale
                     self.grid_surface = pygame.Surface((self.grid_w, self.grid_h))
+                    self._overlay     = pygame.Surface((self.grid_w, self.grid_h), pygame.SRCALPHA)
+                    self._cache_state[:]     = -1
+                    self._cache_z_quant[:]   = -1
+                    self._cache_pheromone[:] = -1
+                    self._grid_dirty         = True
         return False
 
     def close(self):

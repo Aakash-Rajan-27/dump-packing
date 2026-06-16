@@ -127,7 +127,7 @@ W_DISTANCE = 1.0
 W_HEADING  = 0.4
 
 # EARLY PHASE: Massive priority (0.4) on Entry Distance to push trucks to the back.
-WEIGHTS_EARLY = (100, 0, 50, 3, 100, 9)
+WEIGHTS_EARLY = (0, 100, 0, 0, 10, 10)
 
 # MID PHASE: Focus shifts to clustering and filling gaps.
 WEIGHTS_MID   = (0.3, 0.2, 0.2, 0.1, 0.1, 0.1) #the weights are 
