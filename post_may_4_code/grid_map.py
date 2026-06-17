@@ -274,7 +274,7 @@ class GridMap:
         z = self.z_height[r, c]
         if z >= TARGET_PILE_HEIGHT:
             self.state[r, c] = CellState.FILLED
-        elif z > 0:
+        elif z > 0.05:
             self.state[r, c] = CellState.PARTIAL
         else:
             self.state[r, c] = CellState.EMPTY
@@ -285,6 +285,7 @@ class GridMap:
 
     def unreserve(self, r, c):
         if self.state[r, c] == CellState.RESERVED:
+            self.state[r, c] = CellState.EMPTY  # clear first so _update_state reclassifies from z_height
             self._update_state(r, c)
 
     def is_dumpable(self, r, c):

@@ -114,7 +114,6 @@ class Renderer:
         Does NOT touch grid state or any simulation data.
         """
         STRIDE = 8   # sample 1 point per STRIDE waypoints (~25 pts for a 200-wp path)
-        DOT_R  = max(1, self.scale // 3)
 
         for truck in trucks:
             if truck.status == truck.STATUS_NAVIGATING and truck.path:
@@ -159,10 +158,7 @@ class Renderer:
                 continue
 
             # Thin connecting line
-            pygame.draw.lines(self._overlay, light, False, px_points, 1)
-            # Small dot at each sample point so path is visible at low zoom
-            for px, py in px_points:
-                pygame.draw.circle(self._overlay, light, (px, py), DOT_R)
+            pygame.draw.lines(self._overlay, light, False, px_points, 2)
 
     def _draw_grid(self):
         g = self.grid
