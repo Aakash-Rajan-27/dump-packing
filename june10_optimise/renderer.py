@@ -103,7 +103,6 @@ class Renderer:
         Does NOT touch grid state or any simulation data.
         """
         STRIDE = 8   # sample 1 point per STRIDE waypoints (~25 pts for a 200-wp path)
-        DOT_R  = max(1, self.scale // 3)
 
         for truck in trucks:
             if not getattr(truck, "on_grid", True):
@@ -150,10 +149,7 @@ class Renderer:
                 continue
 
             # Thin connecting line
-            pygame.draw.lines(self.grid_surface, light, False, px_points, 1)
-            # Small dot at each sample point so path is visible at low zoom
-            for px, py in px_points:
-                pygame.draw.circle(self.grid_surface, light, (px, py), DOT_R)
+            pygame.draw.lines(self.grid_surface, light, False, px_points, 2)
 
     def _draw_grid(self):
         # THE FIX: Wipe the canvas clean every frame to stop ghost trails
@@ -172,6 +168,8 @@ class Renderer:
                     colour = CELL_COLOURS[CellState.BOUNDARY]
                 elif state in (CellState.PARTIAL, CellState.FILLED):
                     colour = _height_colour(z_norm[r, c])
+                elif state == CellState.RESERVED:
+                    colour = CELL_COLOURS[CellState.EMPTY]
                 else:
                     colour = CELL_COLOURS.get(state, (50, 50, 50))
 
@@ -333,7 +331,6 @@ class Renderer:
             (CellState.EMPTY,         "Empty"),
             (CellState.PARTIAL,       "Partial pile"),
             (CellState.FILLED,        "Full pile"),
-            (CellState.RESERVED,      "Reserved"),
             (CellState.PROTECTED,     "Entry corridor"),
             (CellState.PATH_RESERVED, "Path corridor"),
         ]:

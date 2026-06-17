@@ -429,7 +429,11 @@ def run_simulation():
                         collision_peer = other
                         break
 
-                if collided:
+                if getattr(truck, '_ghost_ticks', 0) > 0:
+                    truck._ghost_ticks -= 1
+                    truck._stuck_substeps = 0
+                    truck._collision_peer = None
+                elif collided:
                     truck.pos[0], truck.pos[1] = prev_x, prev_y
                     truck.heading = prev_heading
                     if was_retreating:
@@ -617,18 +621,10 @@ def run_simulation():
                          if t._stuck_substeps >= _STUCK_LIMIT
                          and t.status == t.STATUS_NAVIGATING]
             if stuck_nav:
-                yielder = max(stuck_nav, key=lambda t: len(t.path))
-                yielder._stuck_substeps    = 0
-                yielder._conflict_cooldown = 3
-                yielder.clear_all_corridors(grid)
-                yielder.cancel_preload(grid)
-                if yielder.dump_target:
-                    grid.unreserve(*yielder.dump_target)
-                    yielder.dump_target = None
-                yielder.status       = yielder.STATUS_IDLE
-                yielder.path         = []
-                yielder.stop_target  = None
-                yielder.staging_pose = None
+                # Grant ghost mode so deeply stuck trucks pass through blockers
+                for t in stuck_nav:
+                    t._ghost_ticks = STEPS_PER_TICK * 3
+                    t._stuck_substeps = 0
 
         for t in trucks:
             if t._conflict_cooldown > 0:

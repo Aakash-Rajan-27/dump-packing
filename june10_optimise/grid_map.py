@@ -261,7 +261,7 @@ class GridMap:
         z = self.z_height[r, c]
         if z >= TARGET_PILE_HEIGHT:
             self.state[r, c] = CellState.FILLED
-        elif z > 0:
+        elif z > 0.05:
             self.state[r, c] = CellState.PARTIAL
         else:
             self.state[r, c] = CellState.EMPTY
