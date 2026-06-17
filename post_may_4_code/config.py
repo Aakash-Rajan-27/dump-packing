@@ -101,12 +101,20 @@ PHEROMONE_SPREAD_SIGMA = max(1.0, 3.0 / CELL_SIZE)
 TRAIL_STRENGTH  = 0.5
 TRAIL_RADIUS_M  = 3.0
 
+# ── Path separation buffer ─────────────────────────────────
+# Minimum gap (metres) enforced between any two trucks' footprints during
+# planning.  The checking truck's half-dimensions are expanded by this value
+# before every SAT overlap test (Minkowski sum), so planned paths never bring
+# two trucks closer than PATH_BUFFER_M apart.
+# Set to 0.0 to disable (bare overlap check only).
+PATH_BUFFER_M = 1.0
+
 # ── CBS / Space-time A* ────────────────────────────────────
 # Waiting in place costs this many times more than moving one cell.
 # Higher value → planner strongly prefers detours over standing still.
 # Must be > 1.0 to prefer any detour; 4.0 means a 4-cell detour is
 # cheaper than waiting 4 steps.
-ASTAR_WAIT_COST = 40.0
+ASTAR_WAIT_COST = 4.0
 # When locking other trucks' future positions as space-time constraints,
 # only look this many steps ahead. Beyond the horizon the cell is free,
 # forcing the planner to route around near-future conflicts rather than
@@ -116,7 +124,7 @@ LOCKED_PATH_HORIZON = 25
 # 250 → ~48M states; 60 → ~11M states — 4x faster per call.
 ASTAR_MAX_TIME = 150  # 90x90 grid diagonal ~127 cells; 150 covers detours during CBS conflict resolution
 # Max CBS nodes to expand before giving up on inter-truck conflict resolution.
-CBS_MAX_NODES = 20
+CBS_MAX_NODES = 150
 
 # ── MCTS ───────────────────────────────────────────────────
 MCTS_SIMULATIONS = 200

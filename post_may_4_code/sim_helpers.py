@@ -14,7 +14,7 @@ import numpy as np
 
 import grid_map
 from truck import Truck
-from pathfinder import (plan_staging_paths, plan_paths_cbs, _path_cells)
+from pathfinder import (plan_staging_paths, plan_paths_cbs, _path_cells, _make_locked_entry)
 from config import ENTRY_POINT, FLEET_COMPOSITION
 
 
@@ -110,8 +110,8 @@ def _try_inplace_replan(ta, tb, grid, entry_rc):
     exit_t = tb if a_nav else ta
 
     if nav_t.path:
-        locked = {nav_t.id: ([nav_t.front_center_cell(grid)] + list(nav_t.path),
-                              nav_t._dump_ticks_required + 2)}
+        locked = {nav_t.id: _make_locked_entry(nav_t, nav_t.path,
+                                                nav_t._dump_ticks_required + 2, grid)}
         exit_t._clear_exit_corridor(grid)
         ep = plan_paths_cbs(grid, [(exit_t, entry_rc)], locked_paths=locked)
         np_exit = ep.get(exit_t.id, [])
@@ -123,7 +123,7 @@ def _try_inplace_replan(ta, tb, grid, entry_rc):
             return True
 
     if exit_t._exit_path and nav_t.dump_target:
-        locked = {exit_t.id: ([exit_t.front_center_cell(grid)] + list(exit_t._exit_path), 0)}
+        locked = {exit_t.id: _make_locked_entry(exit_t, exit_t._exit_path, 0, grid)}
         nav_t.clear_all_corridors(grid)
         np2, ns2 = plan_staging_paths(grid, [(nav_t, nav_t.dump_target)],
                                       locked_paths=locked)

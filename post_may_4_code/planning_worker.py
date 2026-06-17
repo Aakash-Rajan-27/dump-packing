@@ -228,6 +228,35 @@ def _execute_planning_task(task, result_q):
         else:
             result_q.put({'type': 'gate', 'truck_id': t_snap.id, 'result': None})
 
+    # ── TRIGGERED REPLAN (new truck entered polygon) ──────────────────────────
+    elif ttype == 'replan':
+        nav_assignments = task['nav_assignments']   # [(t_snap, dump_target_cell), ...]
+        exit_snaps      = task['exit_trucks']        # [t_snap, ...]
+        locked          = task['locked_paths']
+
+        nav_paths  = {}   # {tid: (path, staging_pose)}
+        exit_paths = {}   # {tid: path}
+
+        if nav_assignments:
+            print(f"[REPLAN] Replanning nav trucks "
+                  f"{[s.id for s, _ in nav_assignments]} with updated constraints")
+            paths, staging = plan_staging_paths(
+                grid_snap, nav_assignments, locked_paths=locked)
+            for t_snap, _dp in nav_assignments:
+                nav_paths[t_snap.id] = (paths.get(t_snap.id, []),
+                                        staging.get(t_snap.id))
+
+        if exit_snaps:
+            print(f"[REPLAN] Replanning exit trucks "
+                  f"{[s.id for s in exit_snaps]} with updated constraints")
+            exit_assgn = [(t_snap, entry_rc) for t_snap in exit_snaps]
+            xit_result = plan_paths_cbs(grid_snap, exit_assgn, locked_paths=locked)
+            for t_snap in exit_snaps:
+                exit_paths[t_snap.id] = xit_result.get(t_snap.id, [])
+
+        result_q.put({'type': 'replan', 'nav_paths': nav_paths,
+                      'exit_paths': exit_paths})
+
 
 def _planning_worker(work_q, result_q, stop_evt):
     """Background planning thread — runs until stop_evt is set."""
@@ -258,6 +287,8 @@ def _planning_worker(work_q, result_q, stop_evt):
                     snap = task.get('truck_snap')
                     if snap is not None:
                         result_q.put({'type': 'exit_escape', 'truck_id': snap.id, 'path': []})
+                elif ttype == 'replan':
+                    result_q.put({'type': 'replan', 'nav_paths': {}, 'exit_paths': {}})
             except Exception:
                 pass
         finally:

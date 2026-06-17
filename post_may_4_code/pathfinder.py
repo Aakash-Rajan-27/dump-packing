@@ -23,6 +23,7 @@ from path_utils import (
     _truck_front_cell, _truck_rear_pose, _truck_front_world,
     _truck_inside_boundary,
     _corridor_cell_set,
+    _make_locked_entry,
 )
 
 from bicycle_model import (
@@ -55,6 +56,9 @@ from conflict_detect import (
     _rect_overlap_2d,
     _infer_heading_at_t,
     _detect_first_conflict,
+    _footprints_conflict,
+    _merge_fp_constraints,
+    _build_locked_footprints,
 )
 
 from staging_paths import plan_staging_paths

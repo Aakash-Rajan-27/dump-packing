@@ -1,14 +1,17 @@
 # conflict_detect.py
 # ─────────────────────────────────────────────────────────────
-# Conflict detection for multi-agent path planning:
-#   • _rect_overlap_2d()      — SAT oriented-rectangle test
-#   • _infer_heading_at_t()   — heading from cell-path direction
-#   • _detect_first_conflict() — earliest vertex or edge conflict
+# Conflict detection and footprint-constraint helpers:
+#   • _rect_overlap_2d()         — SAT oriented-rectangle test
+#   • _infer_heading_at_t()      — heading from cell-path direction
+#   • _detect_first_conflict()   — earliest vertex or edge conflict
+#   • _footprints_conflict()     — single footprint vs constraint dict
+#   • _merge_fp_constraints()    — combine two {t:[fp,...]} dicts
+#   • _build_locked_footprints() — convert locked_paths to {t:[fp,...]}
 # ─────────────────────────────────────────────────────────────
 
 import math
 from path_utils import _corridor_cell_set
-from config import ENTRY_POINT, ENTRY_CORRIDOR_CELLS
+from config import ENTRY_POINT, ENTRY_CORRIDOR_CELLS, PATH_BUFFER_M
 
 
 def _rect_overlap_2d(cx1, cy1, h1, hl1, hw1, cx2, cy2, h2, hl2, hw2):
@@ -57,6 +60,90 @@ def _infer_heading_at_t(path, t):
         if dr or dc:
             return math.atan2(dr, dc)
     return 0.0
+
+
+def _footprints_conflict(cx, cy, heading, hl, hw, t, fp_constraints, buffer=PATH_BUFFER_M):
+    """Return True if the truck footprint (cx,cy,heading,hl,hw) comes within
+    `buffer` metres of any locked footprint at timestep t.
+
+    The checking truck's half-dimensions are expanded by `buffer` (Minkowski sum)
+    before the SAT test, so the check rejects any position where the real gap
+    between the two rectangles would be less than `buffer`.
+
+    fp_constraints is a dict {t: [(cx,cy,h,hl,hw),...]}."""
+    ehl = hl + buffer
+    ehw = hw + buffer
+    for fp_cx, fp_cy, fp_h, fp_hl, fp_hw in fp_constraints.get(t, ()):
+        if _rect_overlap_2d(cx, cy, heading, ehl, ehw, fp_cx, fp_cy, fp_h, fp_hl, fp_hw):
+            return True
+    return False
+
+
+def _merge_fp_constraints(a, b):
+    """Merge two {t: [footprint_tuples]} dicts into one (non-destructive)."""
+    if not a:
+        return b
+    if not b:
+        return a
+    merged = {t: list(fps) for t, fps in a.items()}
+    for t, fps in b.items():
+        if t in merged:
+            merged[t] = merged[t] + fps
+        else:
+            merged[t] = list(fps)
+    return merged
+
+
+def _build_locked_footprints(locked_paths, grid):
+    """Convert a locked_paths dict to a per-timestep footprint dict.
+
+    locked_paths values must be 4-tuples produced by _make_locked_entry():
+      (body_center_poses, tail_ticks, half_length, half_width)
+    where body_center_poses is a list of (cx, cy, heading) body-centre world coords.
+
+    Returns {t: [(cx, cy, heading, hl, hw), ...]} sampled at one footprint per
+    grid.cell_size of travel along each locked path, so that timestep t here
+    matches timestep t in the space-time planners (which also advance t by one
+    cell-width of travel per planning step).
+    """
+    result = {}
+
+    for path_entry in (locked_paths or {}).values():
+        if len(path_entry) != 4:
+            continue
+        raw_path, tail_ticks, hl, hw = path_entry
+
+        if not raw_path:
+            continue
+
+        def _add(t, cx, cy, h):
+            result.setdefault(t, []).append((float(cx), float(cy), float(h),
+                                             float(hl), float(hw)))
+
+        # Emit first footprint at t=0 (truck's current position).
+        t = 0
+        prev_x, prev_y = float(raw_path[0][0]), float(raw_path[0][1])
+        _add(0, prev_x, prev_y, float(raw_path[0][2]))
+        accum = 0.0
+
+        for wp in raw_path[1:]:
+            cx, cy, h = float(wp[0]), float(wp[1]), float(wp[2])
+            dist = math.hypot(cx - prev_x, cy - prev_y)
+            accum += dist
+            # Emit one footprint per cell_size of travel to match planner timesteps.
+            while accum >= grid.cell_size:
+                accum -= grid.cell_size
+                t += 1
+                _add(t, cx, cy, h)
+            prev_x, prev_y = cx, cy
+
+        # Tail: hold the final pose for tail_ticks more planner timesteps.
+        if tail_ticks > 0:
+            fx, fy, fh = float(raw_path[-1][0]), float(raw_path[-1][1]), float(raw_path[-1][2])
+            for dt in range(tail_ticks):
+                _add(t + dt + 1, fx, fy, fh)
+
+    return result
 
 
 def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
@@ -115,8 +202,13 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
                         hj = _infer_heading_at_t(paths_dict[aj], t)
                         wxi, wyi = grid.cell_to_world(pi[0], pi[1])
                         wxj, wyj = grid.cell_to_world(pj[0], pj[1])
-                        if not _rect_overlap_2d(wxi, wyi, hi, ti.length / 2, ti.width / 2,
-                                                wxj, wyj, hj, tj.length / 2, tj.width / 2):
+                        # Expand ti's footprint by PATH_BUFFER_M (Minkowski sum) so
+                        # CBS treats paths within buffer distance as a conflict.
+                        if not _rect_overlap_2d(wxi, wyi, hi,
+                                                ti.length / 2 + PATH_BUFFER_M,
+                                                ti.width  / 2 + PATH_BUFFER_M,
+                                                wxj, wyj, hj,
+                                                tj.length / 2, tj.width / 2):
                             continue
                         # SAT says rectangles touch — but if the planned path
                         # corridors share no cells, the paths never actually cross
@@ -176,8 +268,11 @@ def _detect_first_conflict(paths_dict, truck_map=None, grid=None):
                                 mid_iy = (wpi[1] + wci[1]) / 2
                                 mid_jx = (wpj[0] + wcj[0]) / 2
                                 mid_jy = (wpj[1] + wcj[1]) / 2
-                                if not _rect_overlap_2d(mid_ix, mid_iy, hi, ti.length / 2, ti.width / 2,
-                                                        mid_jx, mid_jy, hj, tj.length / 2, tj.width / 2):
+                                if not _rect_overlap_2d(mid_ix, mid_iy, hi,
+                                                        ti.length / 2 + PATH_BUFFER_M,
+                                                        ti.width  / 2 + PATH_BUFFER_M,
+                                                        mid_jx, mid_jy, hj,
+                                                        tj.length / 2, tj.width / 2):
                                     continue
                         print(f"[CONFLICT] EDGE SWAP: trucks {ai} and {aj} swapped at t={t} "
                               f"— {prev_i}↔{prev_j}")

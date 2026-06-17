@@ -183,7 +183,7 @@ def escape_and_replan_exit(truck, grid, all_trucks, entry_rc):
                     driveable[nr, nc, :] = True
 
     astar_path = astar_st(driveable, grid, esc_cell, entry_rc, truck,
-                          constraints=frozenset(),
+                          fp_constraints={},
                           stop_dist_cells=float(ENTRY_CORRIDOR_CELLS),
                           max_time=500)
 

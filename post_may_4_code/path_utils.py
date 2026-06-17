@@ -14,6 +14,67 @@ import grid_map
 from config import ENTRY_POINT, POSE_HEADING_BUCKETS
 
 
+def _make_locked_entry(truck, path, tail_ticks, grid=None):
+    """Build a locked_paths entry for one truck.
+
+    Returns (body_center_poses, tail_ticks, half_length, half_width) where
+    body_center_poses is a list of (cx, cy, heading) world positions measured
+    at the body centre, suitable for footprint-overlap checking.
+
+    Path waypoints can be:
+      (rear_x, rear_y, heading) floats — smooth bicycle path output
+      (r, c, heading) int r/c        — coarse A* path with heading
+      (r, c)          int r/c        — coarse A* path without heading
+    All are converted to body-centre world coords.  Cell waypoints without an
+    explicit heading use the heading of the nearest forward smooth waypoint, or
+    the direction between consecutive cells, so the footprint is approximately
+    oriented correctly even for coarse-path segments.
+    """
+    hl = truck.length / 2.0
+    hw = truck.width / 2.0
+
+    # Build raw list of (wx, wy, heading_or_None) body-centre world positions.
+    # First entry is the truck's current body centre (always known exactly).
+    raw = [(float(truck.pos[0]), float(truck.pos[1]), float(truck.heading))]
+
+    for wp in (path or []):
+        if len(wp) >= 3 and not isinstance(wp[0], (int, np.integer)):
+            # Smooth bicycle waypoint: (rear_x, rear_y, heading)
+            rx, ry, h = float(wp[0]), float(wp[1]), float(wp[2])
+            raw.append((rx + math.cos(h) * hl, ry + math.sin(h) * hl, h))
+        elif len(wp) >= 3 and grid is not None:
+            # Coarse A* waypoint: (r, c, heading)
+            r, c, h = int(wp[0]), int(wp[1]), float(wp[2])
+            wx, wy = grid.cell_to_world(r, c)
+            raw.append((wx, wy, h))
+        elif len(wp) >= 2 and grid is not None:
+            # Coarse A* waypoint: (r, c) — heading inferred later
+            r, c = int(wp[0]), int(wp[1])
+            wx, wy = grid.cell_to_world(r, c)
+            raw.append((wx, wy, None))
+        elif len(wp) >= 2:
+            raw.append((float(wp[0]), float(wp[1]), None))
+
+    # Fill in None headings: prefer the nearest forward pose with a known heading;
+    # fall back to the direction between consecutive positions.
+    for i in range(len(raw)):
+        if raw[i][2] is not None:
+            continue
+        h = 0.0
+        for fwd in range(i + 1, min(i + 5, len(raw))):
+            if raw[fwd][2] is not None:
+                h = raw[fwd][2]
+                break
+            dx = raw[fwd][0] - raw[i][0]
+            dy = raw[fwd][1] - raw[i][1]
+            if dx * dx + dy * dy > 1e-9:
+                h = math.atan2(dy, dx)
+                break
+        raw[i] = (raw[i][0], raw[i][1], h)
+
+    return (raw, tail_ticks, hl, hw)
+
+
 # ── 8-directional heading bucket tables ──────────────────────────────────────
 # Maps each of the 4 cardinal (row, col) step directions to an integer "bucket" index.
 # The driveable mask's third dimension is indexed by this bucket so we can have

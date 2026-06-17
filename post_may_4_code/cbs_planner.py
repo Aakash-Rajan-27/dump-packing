@@ -4,16 +4,22 @@
 # dump/exit path planning using space-time A*.
 #
 # High level  — constraint tree; split on detected conflicts.
-# Low level   — astar_st() with hard (r,c,t) forbidden states.
+# Low level   — astar_st() with hard footprint-overlap forbidden states.
+#
+# Collision model: all constraints are stored as oriented truck
+# footprints {t: [(cx,cy,h,hl,hw),...]} and checked via SAT
+# (_rect_overlap_2d).  No (r, c, t) cell-occupancy logic remains.
 # ─────────────────────────────────────────────────────────────
 
 import heapq
 import math
 import grid_map
-from path_utils import _path_cells, _truck_front_cell, _state_cell
+from path_utils import _path_cells, _truck_front_cell, _state_cell, _make_locked_entry
 from bicycle_model import interpolate_path_to_truck_states
 from astar_core import astar, astar_st
-from conflict_detect import _detect_first_conflict
+from conflict_detect import (_detect_first_conflict, _infer_heading_at_t,
+                              _build_locked_footprints, _merge_fp_constraints,
+                              _footprints_conflict)
 from filters import make_driveable_mask
 from config import (DRIVE_CLEARANCE_M, _TAN_REPOSE, ENTRY_POINT,
                     LOCKED_PATH_HORIZON, CBS_MAX_NODES,
@@ -25,36 +31,22 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
     Conflict-Based Search (CBS) for multi-agent path planning.
 
     High level  — constraint tree; split on detected conflicts.
-    Low level   — space-time A* (astar_st) with hard (r,c,t) forbidden states.
-                  Trucks wait in place or detour; conflicts are never permitted.
+    Low level   — space-time A* (astar_st) with hard footprint constraints.
 
-    locked_paths: dict {truck_id: [(r,c), ...]} — remaining waypoints of trucks
-      already moving.  Their cells are added as hard (r,c,t) constraints so new
-      paths cannot occupy those cells at those exact timesteps.
+    locked_paths: dict {truck_id: (body_center_poses, tail_ticks, hl, hw)}
+      produced by _make_locked_entry().  Their full footprints are converted to
+      a per-timestep dict and used as hard constraints so new paths cannot
+      overlap those trucks' bodies at those timesteps.
     """
-    if not assignments:  # nothing to plan — return immediately
+    if not assignments:
         return {}
 
-    entry_rc   = grid.world_to_cell(*ENTRY_POINT)  # entry gate cell, precomputed once
-    mask_cache = {}  # cache driveable masks per truck class — expensive to rebuild
+    entry_rc   = grid.world_to_cell(*ENTRY_POINT)
+    mask_cache = {}
 
-    # ── BUILD LOCKED SPACE-TIME CONSTRAINTS ─────────────────────────────────────
-    locked_st_constraints: set = set()
-    if locked_paths:
-        for path_entry in locked_paths.values():
-            if isinstance(path_entry, tuple):
-                raw_path, tail_ticks = path_entry
-            else:
-                raw_path, tail_ticks = path_entry, 0
-            cells = _path_cells(grid, raw_path)
-            # Use the full path length as constraints (not just LOCKED_PATH_HORIZON).
-            # astar_st is bounded by max_time so extra entries beyond that are free.
-            for t, (r, c) in enumerate(cells):
-                locked_st_constraints.add((r, c, t))
-            if cells and tail_ticks > 0:
-                fr, fc = cells[-1]
-                for t in range(len(cells), len(cells) + tail_ticks):
-                    locked_st_constraints.add((fr, fc, t))
+    # ── BUILD LOCKED FOOTPRINT CONSTRAINTS ───────────────────────────────────────
+    # {t: [(cx, cy, heading, hl, hw), ...]} — one entry per cell-size of travel.
+    locked_footprints = _build_locked_footprints(locked_paths, grid)
 
     # ── PER-AGENT SETUP ───────────────────────────────────────────────────────────
     agent_info = {}
@@ -62,15 +54,11 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         is_exit  = (target_rc == entry_rc)
         mask_key = (truck.truck_class, is_exit)
         if mask_key not in mask_cache:
-            # Exit trucks need ignore_path_reserved=True so they can cross active
-            # dump corridors on the way back to the gate; CBS time constraints
-            # still prevent collisions with the navigating truck.
             mask_cache[mask_key] = make_driveable_mask(grid, truck,
                                                        ignore_path_reserved=is_exit)
         driveable  = mask_cache[mask_key]
         truck_cell = _truck_front_cell(grid, truck)
 
-        # Extended bulldozer: force start cell + radius driveable.
         if is_exit:
             r_pile_m    = (1.2 * truck.payload_volume_m3 / (math.pi * _TAN_REPOSE)) ** (1 / 3)
             bulldozer_r = max(2, int(math.ceil(r_pile_m / grid.cell_size)))
@@ -113,7 +101,6 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         return path
 
     def smooth_paths(coarse_paths):
-        """Smooth each coarse cell path with the bicycle model."""
         out = {}
         for aid, coarse in coarse_paths.items():
             truck   = agent_info[aid]['truck']
@@ -163,59 +150,66 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         aid  = next(iter(agent_info))
         info = agent_info[aid]
         path = []
-        # Only try spatial A* when there are no locked ST constraints — spatial A*
-        # has no time dimension and silently ignores every locked (r,c,t) constraint,
-        # producing paths that collide with already-moving trucks.
-        if not locked_st_constraints:
+        # Only try spatial A* when there are no locked footprint constraints.
+        if not locked_footprints:
             path = astar(info['driveable'], grid, info['start'], info['target'],
-                         info['truck'], blocked_cells=frozenset(),
-                         stop_dist_cells=info['stop_dist'])
+                         info['truck'], stop_dist_cells=info['stop_dist'])
             path = _at_target_fix(path, aid)
         if not path:
             path = astar_st(info['driveable'], grid, info['start'], info['target'],
-                            info['truck'], locked_st_constraints, info['stop_dist'])
+                            info['truck'], locked_footprints, info['stop_dist'])
             path = _at_target_fix(path, aid)
         return smooth_paths({aid: path})
 
     # ── SPATIAL-FIRST (APPROACH B) ────────────────────────────────────────────────
+    _truck_map_sp = {_aid: agent_info[_aid]['truck'] for _aid in agent_info}
     _sp_paths = {}
     for _aid in agent_info:
         _info = agent_info[_aid]
         _p = astar(_info['driveable'], grid, _info['start'], _info['target'],
-                   _info['truck'], blocked_cells=frozenset(),
-                   stop_dist_cells=_info['stop_dist'])
+                   _info['truck'], stop_dist_cells=_info['stop_dist'])
         _sp_paths[_aid] = _at_target_fix(_p, _aid)
     _cell_sp = {_aid: [(wp[0], wp[1]) for wp in _p] for _aid, _p in _sp_paths.items()}
-    # Only take the spatial shortcut when there are no locked ST constraints either —
-    # spatial paths have no time index and cannot respect (r,c,t) locked constraints.
-    _sp_clear = not locked_st_constraints
-    if _sp_clear and _detect_first_conflict(_cell_sp, truck_map=None, grid=None) is None:
+
+    # Only take the spatial shortcut when there are no locked footprint constraints
+    # AND the SAT rectangle check confirms no footprint overlaps at any timestep.
+    _sp_clear = not locked_footprints
+    if _sp_clear and _detect_first_conflict(_cell_sp, truck_map=_truck_map_sp, grid=grid) is None:
         return smooth_paths(_sp_paths)
+
     if not _sp_clear:
-        # Check the spatial paths against locked constraints (time-indexed).
+        # Check spatial paths against locked footprint constraints (time-indexed).
         _locked_hit = False
         for _aid, _cells in _cell_sp.items():
-            for _r, _c, _t in locked_st_constraints:
-                if _t < len(_cells) and _cells[_t] == (_r, _c):
-                    _locked_hit = True
-                    break
+            _t_info = agent_info[_aid]
+            _hl = _t_info['truck'].length / 2.0
+            _hw = _t_info['truck'].width / 2.0
+            for _t, _fps in locked_footprints.items():
+                if _t < len(_cells):
+                    _cr, _cc = _cells[_t]
+                    _cwx, _cwy = grid.cell_to_world(_cr, _cc)
+                    _ch = _infer_heading_at_t(_cells, _t)
+                    if _footprints_conflict(_cwx, _cwy, _ch, _hl, _hw, _t, locked_footprints):
+                        _locked_hit = True
+                        break
             if _locked_hit:
                 break
         if not _locked_hit and _detect_first_conflict(_cell_sp, truck_map=None, grid=None) is None:
             return smooth_paths(_sp_paths)
-    # ─────────────────────────────────────────────────────────────────────────────
 
     # ── CBS HIGH-LEVEL SEARCH ─────────────────────────────────────────────────────
-    init_constraints = {aid: set() for aid in agent_info}
+    # Constraints per agent: dict {t: [(cx, cy, h, hl, hw), ...]}
+    init_constraints = {aid: {} for aid in agent_info}
     init_paths = {}
     for aid in agent_info:
         info = agent_info[aid]
-        hard = init_constraints[aid] | locked_st_constraints
+        hard = _merge_fp_constraints(init_constraints[aid], locked_footprints)
         path = astar_st(info['driveable'], grid, info['start'], info['target'],
                         info['truck'], hard, info['stop_dist'])
         init_paths[aid] = _at_target_fix(path, aid)
     init_cost = sum(len(p) for p in init_paths.values())
 
+    truck_map = {aid: agent_info[aid]['truck'] for aid in agent_info}
     _nid = 0
     heap = [(init_cost, _nid, init_constraints, init_paths)]
     MAX_NODES = CBS_MAX_NODES
@@ -225,7 +219,6 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
             break
         cost, _, constraints, paths = heapq.heappop(heap)
 
-        truck_map = {aid: agent_info[aid]['truck'] for aid in agent_info}
         conflict = _detect_first_conflict(paths, truck_map=truck_map, grid=grid)
 
         if conflict is None:
@@ -233,19 +226,31 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
 
         if conflict[0] == 'vertex':
             _, ai, aj, ri, ci, rj, cj, t = conflict
-            branches = [(ai, ri, ci, t), (aj, rj, cj, t)]
+            # Branch for ai: avoid aj's footprint at (rj, cj) at time t.
+            # Branch for aj: avoid ai's footprint at (ri, ci) at time t.
+            branch_info = [(ai, aj, rj, cj, t), (aj, ai, ri, ci, t)]
             print(f"\nVertex conflict detected")
         else:
             _, ai, aj, r1, c1, r2, c2, t = conflict
-            branches = [(ai, r1, c1, t), (aj, r2, c2, t)]
+            # curr_i=(r1,c1), curr_j=(r2,c2).  Each branch avoids the other's position.
+            branch_info = [(ai, aj, r2, c2, t), (aj, ai, r1, c1, t)]
             print(f"\nEdge conflict detected")
 
-        for branch_agent, r, c, t in branches:
-            new_cons = {k: set(v) for k, v in constraints.items()}
-            new_cons[branch_agent].add((r, c, t))
+        for branch_agent, other_agent, or_, oc, t in branch_info:
+            # Build the opposing truck's footprint at the conflict cell + time.
+            ot        = truck_map[other_agent]
+            owx, owy  = grid.cell_to_world(or_, oc)
+            oh        = _infer_heading_at_t(paths.get(other_agent, []), t)
+            fp        = (owx, owy, oh, ot.length / 2.0, ot.width / 2.0)
+
+            new_cons = {k: {tt: list(fps) for tt, fps in v.items()}
+                        for k, v in constraints.items()}
+            branch_t_list = new_cons[branch_agent].setdefault(t, [])
+            new_cons[branch_agent][t] = branch_t_list + [fp]
+
             new_paths = dict(paths)
             info = agent_info[branch_agent]
-            hard = new_cons[branch_agent] | locked_st_constraints
+            hard = _merge_fp_constraints(new_cons[branch_agent], locked_footprints)
             bpath = astar_st(info['driveable'], grid, info['start'], info['target'],
                              info['truck'], hard, info['stop_dist'])
             new_paths[branch_agent] = _at_target_fix(bpath, branch_agent)

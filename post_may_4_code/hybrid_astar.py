@@ -5,6 +5,10 @@
 #   • _hybrid_primitive() — one forward bicycle arc
 #   • hybrid_astar_to_staging()    — spatial-only version
 #   • hybrid_astar_to_staging_st() — space-time (CBS) version
+#
+# Collision model: every candidate pose is checked against the
+# full oriented truck footprint using _rect_overlap_2d / SAT —
+# no single-cell occupancy logic remains.
 # ─────────────────────────────────────────────────────────────
 
 import heapq
@@ -13,8 +17,9 @@ import grid_map
 from path_utils import _angle_diff_signed
 from filters import is_pose_driveable, make_driveable_mask
 from config import (ENTRY_POINT, POSE_HEADING_BUCKETS, TRUCK_MOVE_STEP_M,
-                    ASTAR_WAIT_COST, ASTAR_MAX_TIME)
+                    ASTAR_WAIT_COST, ASTAR_MAX_TIME, PATH_BUFFER_M)
 from staging import score_staging_candidates
+from conflict_detect import _rect_overlap_2d, _footprints_conflict
 
 
 def _pose_bucket(heading):
@@ -27,17 +32,12 @@ def _pose_heading(bucket):
 
 
 def _pose_allowed(grid, truck, x, y, heading):
-    # Allow the truck body to straddle the boundary only while it is literally
-    # crossing the gate threshold (within 1 truck-length of ENTRY_POINT).
     if math.hypot(x - ENTRY_POINT[0], y - ENTRY_POINT[1]) <= truck.length:
         return True
     return is_pose_driveable(grid, truck, x, y, heading)
 
 
 def _mask_pose_allowed(grid, driveable, x, y, heading, grace_dist=5.0):
-    # Grace zone: skip the mask check near the entry so trucks can cross the gate.
-    # Callers that know the truck length pass (truck.length + 2.0) so large trucks
-    # can straddle the boundary during entry/exit without being blocked.
     if math.hypot(x - ENTRY_POINT[0], y - ENTRY_POINT[1]) <= grace_dist:
         return True
     r, c = grid.world_to_cell(x, y)
@@ -51,7 +51,6 @@ def _hybrid_primitive(grid, truck, driveable, x, y, heading, turn):
     samples = max(1, int(math.ceil(travel / TRUCK_MOVE_STEP_M)))
     ds = travel / samples
     d_heading = 0.0 if turn == 0 else turn * heading_step / samples
-    # Grace zone is one full truck length + 2 m so any size truck can cross the gate.
     grace = truck.length + 2.0
     poses = []
 
@@ -77,10 +76,31 @@ def _route_exactly_driveable(grid, truck, path):
     return True
 
 
-def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset(), driveable=None):
-    """Plan forward bicycle arcs to an outward-facing staging pose."""
+def _footprint_blocked(truck, x, y, heading, blocked_footprints, buffer=PATH_BUFFER_M):
+    """Return True if truck body at (x,y,heading) comes within `buffer` metres
+    of any blocked footprint (Minkowski expansion on the checking truck)."""
+    if not blocked_footprints:
+        return False
+    hl = truck.length / 2.0 + buffer
+    hw = truck.width  / 2.0 + buffer
+    for fx, fy, fh, fhl, fhw in blocked_footprints:
+        if _rect_overlap_2d(x, y, heading, hl, hw, fx, fy, fh, fhl, fhw):
+            return True
+    return False
+
+
+def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_footprints=(), driveable=None):
+    """Plan forward bicycle arcs to an outward-facing staging pose.
+
+    blocked_footprints: sequence of (cx, cy, heading, half_length, half_width) —
+      truck body footprints that must never be overlapped.  Replaces the old
+      blocked_cells frozenset; all collision checks now use SAT rectangle overlap.
+    """
     if driveable is None:
         driveable = make_driveable_mask(grid, truck)
+
+    hl = truck.length / 2.0
+    hw = truck.width / 2.0
 
     start_rc = grid.world_to_cell(*truck.pos)
     start = (start_rc[0], start_rc[1], _pose_bucket(truck.heading))
@@ -109,13 +129,14 @@ def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset()
             if not primitive:
                 continue
             nx, ny, nh = primitive[-1]
+            # Full-footprint blocked check — replaces (nr, nc) in blocked_cells.
+            if _footprint_blocked(truck, nx, ny, nh, blocked_footprints):
+                continue
             nr, nc = grid.world_to_cell(nx, ny)
             next_state = (nr, nc, _pose_bucket(nh))
             if next_state == state:
                 continue
-            if (nr, nc) in blocked_cells:  # hard block — another truck is here, never enter
-                continue
-            turn_cost = 0.0 if turn == 0 else 0.35 * truck.turn_radius * (2.0 * math.pi / POSE_HEADING_BUCKETS)
+            turn_cost = 0.0 if turn == 0 else 0.01 * truck.turn_radius * (2.0 * math.pi / POSE_HEADING_BUCKETS)
             new_g = g + len(primitive) * TRUCK_MOVE_STEP_M + turn_cost
             if new_g >= g_cost.get(next_state, float('inf')):
                 continue
@@ -162,26 +183,54 @@ def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_cells=frozenset()
     ]
 
 
-def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_cells=frozenset(),
-                                driveable=None, constraints=frozenset(), max_time=ASTAR_MAX_TIME):
-    """
-    Space-time variant of hybrid_astar_to_staging.
+def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_footprints=(),
+                                driveable=None, constraints=None, max_time=ASTAR_MAX_TIME):
+    """Space-time variant of hybrid_astar_to_staging.
+
     State: (r, c, heading_bucket, t).
-    constraints: set of (r, c, t) — forbidden positions at specific timesteps (CBS).
-    Wait action added so the planner can hold position to let another truck pass.
-    Wait poses are included in the output path so the cell-sequence is time-accurate.
+    constraints: dict {t: [(cx, cy, heading, half_length, half_width), ...]}
+      — forbidden footprints at specific timesteps (CBS + locked paths).
+      Every candidate pose is checked against the full oriented truck rectangle
+      using SAT (_rect_overlap_2d).  No (r, c, t) cell-occupancy logic remains.
+    Wait action included so the planner can hold position to let another truck pass.
     """
+    if constraints is None:
+        constraints = {}
     if driveable is None:
         driveable = make_driveable_mask(grid, truck)
+
+    hl = truck.length / 2.0
+    hw = truck.width / 2.0
 
     start_rc = grid.world_to_cell(*truck.pos)
     start_hb = _pose_bucket(truck.heading)
     start    = (start_rc[0], start_rc[1], start_hb, 0)
 
+    # ── EARLY CONFLICT CHECK (start of planning) ─────────────────────────────────
+    constraint_ts = sorted(constraints.keys()) if constraints else []
+    if constraints:
+        print(f"[HYBRID_ST] Truck {truck.id}: planning to staging pose "
+              f"({staging_pose.x:.1f},{staging_pose.y:.1f}) h={staging_pose.heading:.2f}, "
+              f"fp_constraints at t={constraint_ts}")
+        sx, sy = truck.pos
+        sh = truck.heading
+        for check_t in constraint_ts[:3]:
+            if _footprints_conflict(sx, sy, sh, hl, hw, check_t, constraints):
+                print(f"[HYBRID_ST] Truck {truck.id}: RECTANGLE CONFLICT at start pos "
+                      f"({sx:.1f},{sy:.1f}) heading={sh:.2f} at t={check_t}")
+                break
+        else:
+            print(f"[HYBRID_ST] Truck {truck.id}: no rectangle conflict at start position")
+    else:
+        print(f"[HYBRID_ST] Truck {truck.id}: planning to staging pose "
+              f"({staging_pose.x:.1f},{staging_pose.y:.1f}) h={staging_pose.heading:.2f}, "
+              f"no constraints")
+    # ─────────────────────────────────────────────────────────────────────────────
+
     open_heap  = [(0.0, 0.0, start_rc[0], start_rc[1], start_hb, 0)]
     g_cost     = {start: 0.0}
     came_from  = {}
-    actions    = {}          # state → primitive poses list (move) or None (wait)
+    actions    = {}
     state_pose = {start: (truck.pos[0], truck.pos[1], truck.heading)}
     terminal   = None
 
@@ -196,7 +245,6 @@ def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_cells=frozense
 
         x, y, heading = state_pose[state]
 
-        # Terminal: close enough to staging pose with correct heading
         heading_error = abs(_angle_diff_signed(staging_pose.heading, heading))
         if (math.hypot(x - staging_pose.x, y - staging_pose.y) <= 1.5 * grid.cell_size
                 and heading_error <= 2.0 * math.pi / POSE_HEADING_BUCKETS):
@@ -208,13 +256,18 @@ def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_cells=frozense
             continue
 
         # ── WAIT ─────────────────────────────────────────────────────────────────
-        if (r, c, nt) not in constraints:
+        # Check full footprint at current world pose against constraints at nt.
+        _wait_conflict = _footprints_conflict(x, y, heading, hl, hw, nt, constraints)
+        if _wait_conflict:
+            print(f"[HYBRID_ST] Truck {truck.id}: WAIT conflict at "
+                  f"({x:.1f},{y:.1f}) heading={heading:.2f} t={nt}")
+        else:
             wait_state = (r, c, hb, nt)
             wait_g = g + ASTAR_WAIT_COST
             if wait_g < g_cost.get(wait_state, float('inf')):
                 g_cost[wait_state]     = wait_g
                 came_from[wait_state]  = state
-                actions[wait_state]    = None          # sentinel: wait
+                actions[wait_state]    = None
                 state_pose[wait_state] = (x, y, heading)
                 h = (math.hypot(x - staging_pose.x, y - staging_pose.y)
                      + truck.turn_radius * abs(_angle_diff_signed(staging_pose.heading, heading)))
@@ -226,19 +279,26 @@ def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_cells=frozense
             if not primitive:
                 continue
             nx, ny, nh = primitive[-1]
-            nr, nc     = grid.world_to_cell(nx, ny)
-            nhb        = _pose_bucket(nh)
+
+            # Full-footprint blocked check against statically blocked footprints.
+            if _footprint_blocked(truck, nx, ny, nh, blocked_footprints):
+                continue
+
+            # Full-footprint constraint check — replaces (nr, nc, nt) in constraints.
+            if _footprints_conflict(nx, ny, nh, hl, hw, nt, constraints):
+                print(f"[HYBRID_ST] Truck {truck.id}: MOVE conflict → "
+                      f"({nx:.1f},{ny:.1f}) heading={nh:.2f} t={nt}")
+                continue
+
+            nr, nc = grid.world_to_cell(nx, ny)
+            nhb    = _pose_bucket(nh)
             next_state = (nr, nc, nhb, nt)
 
-            if (nr, nc, nhb) == (r, c, hb):   # primitive went nowhere
-                continue
-            if (nr, nc) in blocked_cells:
-                continue
-            if (nr, nc, nt) in constraints:    # CBS hard constraint
+            if (nr, nc, nhb) == (r, c, hb):
                 continue
 
             turn_cost = (0.0 if turn == 0
-                         else 0.35 * truck.turn_radius * (2.0 * math.pi / POSE_HEADING_BUCKETS))
+                         else 0.05 * truck.turn_radius * (2.0 * math.pi / POSE_HEADING_BUCKETS))
             new_g = g + len(primitive) * TRUCK_MOVE_STEP_M + turn_cost
 
             if new_g < g_cost.get(next_state, float('inf')):
@@ -254,23 +314,20 @@ def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_cells=frozense
         return []
 
     # ── PATH RECONSTRUCTION ───────────────────────────────────────────────────────
-    # Wait actions produce a repeated body pose so that _path_cells() gives the
-    # correct time-indexed cell sequence for CBS conflict detection.
     segments = []
     current  = terminal
     while current in came_from:
         parent = came_from[current]
         action = actions[current]
         if action is not None:
-            segments.append(action)                        # bicycle-arc poses
+            segments.append(action)
         else:
-            segments.append([state_pose[parent]])          # one wait pose (repeated cell)
+            segments.append([state_pose[parent]])
         current = parent
     segments.reverse()
 
     body_poses = [pose for seg in segments for pose in seg]
 
-    # Connector: linear interpolation to exact staging pose (same as original)
     connector_start = body_poses[-1] if body_poses else state_pose[start]
     dx = staging_pose.x - connector_start[0]
     dy = staging_pose.y - connector_start[1]
