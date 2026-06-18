@@ -4,15 +4,6 @@ import math
 
 CELL_SIZE = 1.0   # metres per cell (0.5 for finest resolution, 1.0 for speed)
 
-POLYGON_BOUNDARY = [
-    (0,  0),
-    (90, 0),
-    (90, 60),
-    (60, 60),
-    (60, 90),
-    (0,  90),
-]
-
 ENTRY_POINT = (45.0, 0.0)
 
 # ── Mixed Fleet ────────────────────────────────────────────

@@ -13,6 +13,8 @@
 import sys
 import time
 import math
+import random
+import argparse
 import threading
 import queue   as _queue
 import numpy as np
@@ -20,10 +22,11 @@ from scipy.ndimage import gaussian_filter
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-from config import (POLYGON_BOUNDARY, ENTRY_POINT, CELL_SIZE,
+from config import (ENTRY_POINT, CELL_SIZE,
                     FLEET_COMPOSITION, TICK_DELAY, PYGAME_SCALE,
                     PHEROMONE_DECAY, PHEROMONE_SPREAD_SIGMA,
                     STEPS_PER_TICK, ENTRY_CORRIDOR_CELLS)
+from polygon_gen import generate_random_polygon
 import grid_map
 from conflict_detect import (_detect_physical_conflict,
                              _keeper_forbidden_states)
@@ -36,8 +39,22 @@ from sim_helpers import (initialise_half_full_dump, _corridor_cells,
 
 
 def run_simulation():
+    parser = argparse.ArgumentParser(description="Dump-packing simulation")
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Polygon seed to reproduce a specific layout')
+    args, _ = parser.parse_known_args()
+
+    poly_seed = args.seed if args.seed is not None else random.randint(0, 999_999)
+    print(f"\n{'='*48}")
+    print(f"  POLYGON SEED: {poly_seed}  (rerun with --seed {poly_seed})")
+    print(f"{'='*48}\n")
+
     print("Initialising grid...")
-    grid = grid_map.GridMap(POLYGON_BOUNDARY, CELL_SIZE)
+    boundary = generate_random_polygon(seed=poly_seed)
+    xs = [v[0] for v in boundary]; ys = [v[1] for v in boundary]
+    print(f"Generated polygon: {len(boundary)} vertices, "
+          f"x=[{min(xs):.1f},{max(xs):.1f}] y=[{min(ys):.1f},{max(ys):.1f}]")
+    grid = grid_map.GridMap(boundary, CELL_SIZE)
     initialise_half_full_dump(grid)
 
     valid_cells = np.sum(grid.state == grid_map.CellState.EMPTY)
