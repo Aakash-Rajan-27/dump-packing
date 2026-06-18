@@ -104,27 +104,23 @@ TRAIL_RADIUS_M  = 3.0
 # ── Path separation buffer ─────────────────────────────────
 # Minimum gap (metres) enforced between any two trucks' footprints during
 # planning.  The checking truck's half-dimensions are expanded by this value
-# before every SAT overlap test (Minkowski sum), so planned paths never bring
-# two trucks closer than PATH_BUFFER_M apart.
-# Set to 0.0 to disable (bare overlap check only).
-PATH_BUFFER_M = 1.0
+# before every SAT overlap test (Minkowski sum).
+# Keep small: physical safety is already guaranteed by the post-step SAT guard
+# in main.py.  A value of 1.0 required 6.5 m lateral clearance for small trucks
+# (wider than the truck itself), blocking all legitimate parallel-path planning.
+PATH_BUFFER_M = 1
 
 # ── CBS / Space-time A* ────────────────────────────────────
 # Waiting in place costs this many times more than moving one cell.
 # Higher value → planner strongly prefers detours over standing still.
 # Must be > 1.0 to prefer any detour; 4.0 means a 4-cell detour is
 # cheaper than waiting 4 steps.
-ASTAR_WAIT_COST = 4.0
-# When locking other trucks' future positions as space-time constraints,
-# only look this many steps ahead. Beyond the horizon the cell is free,
-# forcing the planner to route around near-future conflicts rather than
-# waiting for the entire remaining path of every other truck to clear.
-LOCKED_PATH_HORIZON = 25
+ASTAR_WAIT_COST = 4
 # Max time-steps the space-time A* is allowed to search (controls state space size).
 # 250 → ~48M states; 60 → ~11M states — 4x faster per call.
-ASTAR_MAX_TIME = 150  # 90x90 grid diagonal ~127 cells; 150 covers detours during CBS conflict resolution
+ASTAR_MAX_TIME = 150  # increased from 90 — gives space-time A* room to wait out blockers
 # Max CBS nodes to expand before giving up on inter-truck conflict resolution.
-CBS_MAX_NODES = 150
+CBS_MAX_NODES = 200
 
 # ── MCTS ───────────────────────────────────────────────────
 MCTS_SIMULATIONS = 200
@@ -135,7 +131,7 @@ W_DISTANCE = 1.0
 W_HEADING  = 0.4
 
 # EARLY PHASE: Massive priority (0.4) on Entry Distance to push trucks to the back.
-WEIGHTS_EARLY = (0, 100, 0, 0, 10, 10)
+WEIGHTS_EARLY = (0, 100, 0, 0, 10, 100)
 
 # MID PHASE: Focus shifts to clustering and filling gaps.
 WEIGHTS_MID   = (0.3, 0.2, 0.2, 0.1, 0.1, 0.1) #the weights are 

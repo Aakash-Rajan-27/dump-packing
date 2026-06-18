@@ -276,9 +276,11 @@ def get_raw_candidates(grid, truck):
     # ── VECTORIZED dumpable ──────────────────────────────────────────────────────
     # Was: Python double loop calling is_dumpable() on every cell (~8100 iterations).
     # Now: one numpy boolean expression — mirrors is_dumpable() exactly but runs in C.
+    # PATH_RESERVED cells are *planned route* cells — still valid dump targets.
+    # Excluding them causes get_raw_candidates to return empty when corridors
+    # cover most of the polygon, triggering premature sim_done.
     _not_dumpable_states = (CellState.BOUNDARY, CellState.PROTECTED,
-                            CellState.OBSTACLE, CellState.FILLED, CellState.RESERVED,
-                            CellState.PATH_RESERVED)
+                            CellState.OBSTACLE, CellState.FILLED, CellState.RESERVED)
     dumpable = (~np.isin(grid.state, list(_not_dumpable_states)) &
                 (grid.z_height < TARGET_PILE_HEIGHT))
 

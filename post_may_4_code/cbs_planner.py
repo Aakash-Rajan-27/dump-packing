@@ -22,8 +22,7 @@ from conflict_detect import (_detect_first_conflict, _infer_heading_at_t,
                               _footprints_conflict)
 from filters import make_driveable_mask
 from config import (DRIVE_CLEARANCE_M, _TAN_REPOSE, ENTRY_POINT,
-                    LOCKED_PATH_HORIZON, CBS_MAX_NODES,
-                    ENTRY_CORRIDOR_CELLS, ASTAR_WAIT_COST)
+                    CBS_MAX_NODES, ENTRY_CORRIDOR_CELLS, ASTAR_WAIT_COST)
 
 
 def plan_paths_cbs(grid, assignments, locked_paths=None):
@@ -59,6 +58,14 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         driveable  = mask_cache[mask_key]
         truck_cell = _truck_front_cell(grid, truck)
 
+        # Corridor-bypass mask — always ignore PATH_RESERVED so the truck can route
+        # through another truck's corridor at timesteps when that truck won't be there.
+        mask_key_ipr = (truck.truck_class, True)
+        if mask_key_ipr not in mask_cache:
+            mask_cache[mask_key_ipr] = make_driveable_mask(grid, truck,
+                                                            ignore_path_reserved=True)
+        driveable_ipr = mask_cache[mask_key_ipr]
+
         if is_exit:
             r_pile_m    = (1.2 * truck.payload_volume_m3 / (math.pi * _TAN_REPOSE)) ** (1 / 3)
             bulldozer_r = max(2, int(math.ceil(r_pile_m / grid.cell_size)))
@@ -72,6 +79,7 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
                 if 0 <= nr < grid.rows and 0 <= nc < grid.cols:
                     if grid.state[nr, nc] != grid_map.CellState.BOUNDARY:
                         driveable[nr, nc, :] = True
+                        driveable_ipr[nr, nc, :] = True
 
         if target_rc == entry_rc:
             stop_dist_cells = float(ENTRY_CORRIDOR_CELLS)
@@ -82,11 +90,12 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
             stop_dist_cells = safe_dist_m / grid.cell_size
 
         agent_info[truck.id] = {
-            'truck':     truck,
-            'start':     truck_cell,
-            'target':    target_rc,
-            'driveable': driveable,
-            'stop_dist': stop_dist_cells,
+            'truck':         truck,
+            'start':         truck_cell,
+            'target':        target_rc,
+            'driveable':     driveable,
+            'driveable_ipr': driveable_ipr,
+            'stop_dist':     stop_dist_cells,
         }
 
     # ── HELPERS ──────────────────────────────────────────────────────────────────
@@ -145,6 +154,32 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
                 out[aid] = smooth
         return out
 
+    # ── CORRIDOR-BYPASS HELPERS ───────────────────────────────────────────────────
+
+    def _at_goal(path, aid):
+        """True if the (r,c) path reaches within stop_dist cells of the goal."""
+        if not path:
+            return False
+        info = agent_info[aid]
+        last = path[-1]
+        return math.hypot(last[0] - info['target'][0],
+                          last[1] - info['target'][1]) <= max(info['stop_dist'], 0.5)
+
+    def _corridor_bypass(aid, fp_constraints):
+        """Retry astar_st with ignore_path_reserved=True so the truck can wait at
+        its current position until the blocking truck's footprint constraints expire,
+        then route through the formerly blocked corridor cells.
+        Only meaningful when fp_constraints is non-empty (defines when the corridor clears)."""
+        if not fp_constraints:
+            return []
+        info  = agent_info[aid]
+        bpath = astar_st(info['driveable_ipr'], grid, info['start'], info['target'],
+                         info['truck'], fp_constraints, info['stop_dist'])
+        if _at_goal(bpath, aid):
+            print(f"[CBS] T{aid}: corridor-bypass plan — truck will wait for blocking "
+                  f"corridor to clear then route through")
+        return bpath
+
     # ── SINGLE-AGENT SHORT-CIRCUIT ────────────────────────────────────────────────
     if len(agent_info) == 1:
         aid  = next(iter(agent_info))
@@ -159,6 +194,11 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
             path = astar_st(info['driveable'], grid, info['start'], info['target'],
                             info['truck'], locked_footprints, info['stop_dist'])
             path = _at_target_fix(path, aid)
+        # Fallback: corridor blocks prevented reaching goal — wait for it to clear.
+        if not _at_goal(path, aid):
+            bypass = _corridor_bypass(aid, locked_footprints)
+            if _at_goal(bypass, aid):
+                path = _at_target_fix(bypass, aid)
         return smooth_paths({aid: path})
 
     # ── SPATIAL-FIRST (APPROACH B) ────────────────────────────────────────────────
@@ -206,6 +246,11 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
         hard = _merge_fp_constraints(init_constraints[aid], locked_footprints)
         path = astar_st(info['driveable'], grid, info['start'], info['target'],
                         info['truck'], hard, info['stop_dist'])
+        # Corridor blocked all routes — try waiting for it to clear.
+        if not _at_goal(path, aid):
+            bypass = _corridor_bypass(aid, hard)
+            if _at_goal(bypass, aid):
+                path = bypass
         init_paths[aid] = _at_target_fix(path, aid)
     init_cost = sum(len(p) for p in init_paths.values())
 
@@ -249,16 +294,34 @@ def plan_paths_cbs(grid, assignments, locked_paths=None):
             new_cons[branch_agent][t] = branch_t_list + [fp]
 
             new_paths = dict(paths)
-            info = agent_info[branch_agent]
-            hard = _merge_fp_constraints(new_cons[branch_agent], locked_footprints)
+            info  = agent_info[branch_agent]
+            hard  = _merge_fp_constraints(new_cons[branch_agent], locked_footprints)
             bpath = astar_st(info['driveable'], grid, info['start'], info['target'],
                              info['truck'], hard, info['stop_dist'])
+            # Corridor blocked all routes for this branch — try bypass.
+            if not _at_goal(bpath, branch_agent):
+                bypass = _corridor_bypass(branch_agent, hard)
+                if _at_goal(bypass, branch_agent):
+                    bpath = bypass
             new_paths[branch_agent] = _at_target_fix(bpath, branch_agent)
             new_cost = sum(len(p) for p in new_paths.values())
             _nid += 1
             heapq.heappush(heap, (new_cost, _nid, new_cons, new_paths))
 
+    def _apply_bypass_to_paths(paths_dict, constraints_dict):
+        """For any truck that didn't reach its goal, try the corridor-bypass path."""
+        final = {}
+        for aid, path in paths_dict.items():
+            if _at_goal(path, aid):
+                final[aid] = path
+            else:
+                merged = _merge_fp_constraints(constraints_dict.get(aid, {}),
+                                               locked_footprints)
+                bypass = _corridor_bypass(aid, merged)
+                final[aid] = bypass if _at_goal(bypass, aid) else path
+        return final
+
     if heap:
-        _, _, _, best = heap[0]
-        return smooth_paths(best)
-    return smooth_paths(init_paths)
+        _, _, constraints_ex, best = heap[0]
+        return smooth_paths(_apply_bypass_to_paths(best, constraints_ex))
+    return smooth_paths(_apply_bypass_to_paths(init_paths, init_constraints))

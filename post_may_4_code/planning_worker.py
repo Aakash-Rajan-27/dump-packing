@@ -13,8 +13,6 @@ import copy as _copy
 import queue as _queue
 import traceback as _traceback
 import numpy as np
-from scipy.ndimage import binary_dilation
-
 import grid_map
 from filters import get_raw_candidates, is_accessible, compute_masks
 from scoring import score_candidates
@@ -74,7 +72,10 @@ def _execute_planning_task(task, result_q):
             return
 
         fp              = grid_snap.fill_pct()
-        coarse, _fine   = compute_masks(grid_snap, repr_truck)
+        # ignore_path_reserved=True: PATH_RESERVED corridors are temporary and must
+        # not block the accessibility BFS — otherwise corridor coverage causes
+        # is_accessible to return False for most cells and the sim ends early.
+        coarse, _fine   = compute_masks(grid_snap, repr_truck, ignore_path_reserved=True)
         top_cands       = []
 
         if fp < CONFIG_MATERIAL_HEIGHT_THRESHOLD:
@@ -138,8 +139,11 @@ def _execute_planning_task(task, result_q):
         locked     = task['locked_paths']
 
         exit_assignments = [(t_snap, entry_rc) for t_snap in exit_snaps]
+        print(f"[PLANNER] Exit planning for T{[s.id for s in exit_snaps]}, "
+              f"pos={[(round(s.pos[0],1), round(s.pos[1],1)) for s in exit_snaps]}")
         exit_paths       = plan_paths_cbs(grid_snap, exit_assignments,
                                           locked_paths=locked)
+        print(f"[PLANNER] Exit result: {[(tid, len(p)) for tid, p in exit_paths.items()]}")
 
         out = {t_snap.id: exit_paths.get(t_snap.id, []) for t_snap in exit_snaps}
         result_q.put({'type': 'exit', 'paths': out})
@@ -162,11 +166,13 @@ def _execute_planning_task(task, result_q):
             result_q.put({'type': 'gate', 'truck_id': t_snap.id, 'result': None})
             return
 
-        fp             = grid_snap.fill_pct()
-        # ignore_path_reserved=True so exit corridors from trucks inside don't block
-        # staging candidates for the incoming truck. Locked paths handle temporal separation.
-        coarse, _fine  = compute_masks(grid_snap, t_snap, ignore_path_reserved=True)
-        top            = []
+        fp = grid_snap.fill_pct()
+
+        # STRICT mask: treat PATH_RESERVED (exit/dump corridors) as solid obstacles.
+        # ONE compute_masks call — used for both accessibility BFS and path planning.
+        # The entering truck's path MUST route spatially around all active corridors.
+        coarse, _fine_strict = compute_masks(grid_snap, t_snap, ignore_path_reserved=False)
+        top = []
 
         if fp < CONFIG_MATERIAL_HEIGHT_THRESHOLD:
             scores = score_candidates(grid_snap, raw)
@@ -185,6 +191,28 @@ def _execute_planning_task(task, result_q):
                 scores = score_candidates(grid_snap, acc)
                 top    = [acc[i] for i in scores.argsort()[-20:][::-1]]
 
+        # Fallback: if strict mask found no accessible candidates, retry with lenient
+        # mask so gate planning isn't permanently blocked when corridors are dense.
+        if not top:
+            coarse_lenient, _fine_strict = compute_masks(grid_snap, t_snap,
+                                                         ignore_path_reserved=True)
+            if fp < CONFIG_MATERIAL_HEIGHT_THRESHOLD:
+                scores = score_candidates(grid_snap, raw)
+                for idx in scores.argsort()[::-1]:
+                    r, c = raw[idx]
+                    if is_accessible(grid_snap, r, c, entry_rc, t_snap,
+                                     precomputed_coarse_mask=coarse_lenient):
+                        top.append((r, c))
+                    if len(top) >= 20:
+                        break
+            else:
+                acc = [(r, c) for r, c in raw
+                       if is_accessible(grid_snap, r, c, entry_rc, t_snap,
+                                        precomputed_coarse_mask=coarse_lenient)]
+                if acc:
+                    scores = score_candidates(grid_snap, acc)
+                    top    = [acc[i] for i in scores.argsort()[-20:][::-1]]
+
         avail = [(r, c) for r, c in top if (r, c) not in claimed]
         if not avail:
             result_q.put({'type': 'gate', 'truck_id': t_snap.id, 'result': None})
@@ -201,23 +229,16 @@ def _execute_planning_task(task, result_q):
             result_q.put({'type': 'gate', 'truck_id': t_snap.id, 'result': None})
             return
 
-        # Temporarily dilate PATH_RESERVED cells in snapshot for corridor safety
-        _hw_buf = int(math.ceil((t_snap.width / 2.0) / grid_snap.cell_size))
-        _pr_mask = (grid_snap.state == grid_map.CellState.PATH_RESERVED)
-        _struct  = np.array(
-            [[math.hypot(dr, dc) <= _hw_buf
-              for dc in range(-_hw_buf, _hw_buf + 1)]
-             for dr in range(-_hw_buf, _hw_buf + 1)], dtype=bool)
-        _expanded = binary_dilation(_pr_mask, structure=_struct)
-        _buf      = (_expanded & ~_pr_mask
-                     & (grid_snap.state != grid_map.CellState.BOUNDARY)
-                     & (grid_snap.state != grid_map.CellState.PROTECTED))
-        grid_snap.state[_buf] = grid_map.CellState.PATH_RESERVED
-
+        # Spatial-only path planning (locked_paths=None → no time-dimension search).
+        # Gate clearance check already provides temporal safety; spatial strict mask
+        # provides the hard non-intersection guarantee with exit corridors.
+        # No corridor-bypass: entering truck must never share cells with exit corridors.
         paths, staging = plan_staging_paths(
-            grid_snap, asgn, locked_paths=locked,
-            ignore_path_reserved=True,
-            precomputed_masks={(t_snap.truck_class, True): _fine})
+            grid_snap, asgn, locked_paths=None,
+            ignore_path_reserved=False,
+            precomputed_masks={(t_snap.truck_class, False): _fine_strict},
+            allow_corridor_bypass=False,
+            spatial_only=True)
         dt   = asgn[0][1]
         path = paths.get(t_snap.id, [])
         sp   = staging.get(t_snap.id)
@@ -228,34 +249,6 @@ def _execute_planning_task(task, result_q):
         else:
             result_q.put({'type': 'gate', 'truck_id': t_snap.id, 'result': None})
 
-    # ── TRIGGERED REPLAN (new truck entered polygon) ──────────────────────────
-    elif ttype == 'replan':
-        nav_assignments = task['nav_assignments']   # [(t_snap, dump_target_cell), ...]
-        exit_snaps      = task['exit_trucks']        # [t_snap, ...]
-        locked          = task['locked_paths']
-
-        nav_paths  = {}   # {tid: (path, staging_pose)}
-        exit_paths = {}   # {tid: path}
-
-        if nav_assignments:
-            print(f"[REPLAN] Replanning nav trucks "
-                  f"{[s.id for s, _ in nav_assignments]} with updated constraints")
-            paths, staging = plan_staging_paths(
-                grid_snap, nav_assignments, locked_paths=locked)
-            for t_snap, _dp in nav_assignments:
-                nav_paths[t_snap.id] = (paths.get(t_snap.id, []),
-                                        staging.get(t_snap.id))
-
-        if exit_snaps:
-            print(f"[REPLAN] Replanning exit trucks "
-                  f"{[s.id for s in exit_snaps]} with updated constraints")
-            exit_assgn = [(t_snap, entry_rc) for t_snap in exit_snaps]
-            xit_result = plan_paths_cbs(grid_snap, exit_assgn, locked_paths=locked)
-            for t_snap in exit_snaps:
-                exit_paths[t_snap.id] = xit_result.get(t_snap.id, [])
-
-        result_q.put({'type': 'replan', 'nav_paths': nav_paths,
-                      'exit_paths': exit_paths})
 
 
 def _planning_worker(work_q, result_q, stop_evt):
@@ -287,8 +280,6 @@ def _planning_worker(work_q, result_q, stop_evt):
                     snap = task.get('truck_snap')
                     if snap is not None:
                         result_q.put({'type': 'exit_escape', 'truck_id': snap.id, 'path': []})
-                elif ttype == 'replan':
-                    result_q.put({'type': 'replan', 'nav_paths': {}, 'exit_paths': {}})
             except Exception:
                 pass
         finally:

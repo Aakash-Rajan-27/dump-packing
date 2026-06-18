@@ -65,20 +65,41 @@ def build_fleet():
     return trucks
 
 
-def _try_inplace_replan(ta, tb, grid, entry_rc):
+def _try_inplace_replan(ta, tb, grid, entry_rc, all_trucks=None):
     """Resolve a conflict between two trucks via CBS without forcing idle.
-    Stays in Thread 1 (rare, fast-path — cooldown limits frequency)."""
+    Stays in Thread 1 (rare, fast-path — cooldown limits frequency).
+
+    all_trucks: full fleet list.  Used to lock third-party trucks so the
+    replanned paths for ta/tb cannot conflict with anyone else.
+    """
     both_nav  = (ta.status == ta.STATUS_NAVIGATING and tb.status == tb.STATUS_NAVIGATING)
     both_exit = (ta.status == ta.STATUS_EXITING    and tb.status == tb.STATUS_EXITING)
     a_nav     = ta.status == ta.STATUS_NAVIGATING
 
+    def _third_locks(excluded_ids):
+        """Build locked_paths for all active trucks not in excluded_ids."""
+        locked = {}
+        for ot in (all_trucks or []):
+            if ot.id in excluded_ids:
+                continue
+            if ot.status == ot.STATUS_NAVIGATING and ot.path:
+                locked[ot.id] = _make_locked_entry(
+                    ot, ot.path, ot._dump_ticks_required + 2, grid)
+            elif ot.status == ot.STATUS_EXITING and ot._exit_path:
+                locked[ot.id] = _make_locked_entry(ot, ot._exit_path, 0, grid)
+            elif ot.status in (ot.STATUS_DUMPING, ot.STATUS_REVERSING):
+                rem = max(0, ot._dump_ticks_required - ot._dump_ticks)
+                locked[ot.id] = _make_locked_entry(ot, [], rem + 2)
+        return locked
+
     if both_nav:
         if not ta.dump_target or not tb.dump_target:
             return False
+        locked = _third_locks({ta.id, tb.id})
         ta.clear_all_corridors(grid)
         tb.clear_all_corridors(grid)
         new_paths, new_staging = plan_staging_paths(
-            grid, [(ta, ta.dump_target), (tb, tb.dump_target)])
+            grid, [(ta, ta.dump_target), (tb, tb.dump_target)], locked_paths=locked)
         np_a = new_paths.get(ta.id, [])
         np_b = new_paths.get(tb.id, [])
         if np_a and np_b:
@@ -92,9 +113,10 @@ def _try_inplace_replan(ta, tb, grid, entry_rc):
         return False
 
     if both_exit:
+        locked = _third_locks({ta.id, tb.id})
         ta._clear_exit_corridor(grid)
         tb._clear_exit_corridor(grid)
-        new_paths = plan_paths_cbs(grid, [(ta, entry_rc), (tb, entry_rc)])
+        new_paths = plan_paths_cbs(grid, [(ta, entry_rc), (tb, entry_rc)], locked_paths=locked)
         np_a = new_paths.get(ta.id, [])
         np_b = new_paths.get(tb.id, [])
         if np_a and np_b:
@@ -110,8 +132,10 @@ def _try_inplace_replan(ta, tb, grid, entry_rc):
     exit_t = tb if a_nav else ta
 
     if nav_t.path:
-        locked = {nav_t.id: _make_locked_entry(nav_t, nav_t.path,
-                                                nav_t._dump_ticks_required + 2, grid)}
+        # Lock nav_t's path plus all unrelated trucks; replan exit_t around everything.
+        locked = _third_locks({exit_t.id})
+        locked[nav_t.id] = _make_locked_entry(
+            nav_t, nav_t.path, nav_t._dump_ticks_required + 2, grid)
         exit_t._clear_exit_corridor(grid)
         ep = plan_paths_cbs(grid, [(exit_t, entry_rc)], locked_paths=locked)
         np_exit = ep.get(exit_t.id, [])
@@ -123,7 +147,9 @@ def _try_inplace_replan(ta, tb, grid, entry_rc):
             return True
 
     if exit_t._exit_path and nav_t.dump_target:
-        locked = {exit_t.id: _make_locked_entry(exit_t, exit_t._exit_path, 0, grid)}
+        # Lock exit_t's path plus all unrelated trucks; replan nav_t around everything.
+        locked = _third_locks({nav_t.id})
+        locked[exit_t.id] = _make_locked_entry(exit_t, exit_t._exit_path, 0, grid)
         nav_t.clear_all_corridors(grid)
         np2, ns2 = plan_staging_paths(grid, [(nav_t, nav_t.dump_target)],
                                       locked_paths=locked)

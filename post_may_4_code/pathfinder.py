@@ -35,6 +35,7 @@ from bicycle_model import (
 from deadlock import (
     generate_reverse_retreat,
     generate_yield_maneuver,
+    generate_deadlock_escape,
     escape_and_replan_exit,
 )
 

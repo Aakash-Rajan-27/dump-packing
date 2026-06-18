@@ -45,7 +45,12 @@ def _mask_pose_allowed(grid, driveable, x, y, heading, grace_dist=5.0):
 
 
 def _hybrid_primitive(grid, truck, driveable, x, y, heading, turn):
-    """Generate one forward bicycle primitive and its intermediate body poses."""
+    """Generate one forward bicycle primitive and its intermediate body poses.
+
+    Returns (poses, travel_m) where travel_m is the arc length of the primitive.
+    Returns (None, 0.0) if the primitive is blocked by the driveable mask.
+    Callers must check `if poses is None`.
+    """
     heading_step = 2.0 * math.pi / POSE_HEADING_BUCKETS
     travel = grid.cell_size if turn == 0 else max(grid.cell_size, truck.turn_radius * heading_step)
     samples = max(1, int(math.ceil(travel / TRUCK_MOVE_STEP_M)))
@@ -61,9 +66,9 @@ def _hybrid_primitive(grid, truck, driveable, x, y, heading, turn):
         heading = (heading + d_heading + math.pi) % (2.0 * math.pi) - math.pi
         if step % 3 == 0 or step == samples - 1:
             if not _mask_pose_allowed(grid, driveable, x, y, heading, grace_dist=grace):
-                return None
+                return None, 0.0
         poses.append((x, y, heading))
-    return poses
+    return poses, travel
 
 
 def _route_exactly_driveable(grid, truck, path):
@@ -125,8 +130,8 @@ def hybrid_astar_to_staging(grid, truck, staging_pose, blocked_footprints=(), dr
             break
 
         for turn in (0, -1, 1):
-            primitive = _hybrid_primitive(grid, truck, driveable, x, y, heading, turn)
-            if not primitive:
+            primitive, _travel = _hybrid_primitive(grid, truck, driveable, x, y, heading, turn)
+            if primitive is None:
                 continue
             nx, ny, nh = primitive[-1]
             # Full-footprint blocked check — replaces (nr, nc) in blocked_cells.
@@ -234,6 +239,10 @@ def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_footprints=(),
     state_pose = {start: (truck.pos[0], truck.pos[1], truck.heading)}
     terminal   = None
 
+    # Conflict counters — accumulated across all heap expansions; printed once at end.
+    _n_wait_conflicts = 0
+    _n_move_conflicts = 0
+
     while open_heap:
         _, g, r, c, hb, t = heapq.heappop(open_heap)
         state = (r, c, hb, t)
@@ -251,43 +260,49 @@ def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_footprints=(),
             terminal = state
             break
 
-        nt = t + 1
-        if nt > max_time:
-            continue
-
         # ── WAIT ─────────────────────────────────────────────────────────────────
-        # Check full footprint at current world pose against constraints at nt.
-        _wait_conflict = _footprints_conflict(x, y, heading, hl, hw, nt, constraints)
-        if _wait_conflict:
-            print(f"[HYBRID_ST] Truck {truck.id}: WAIT conflict at "
-                  f"({x:.1f},{y:.1f}) heading={heading:.2f} t={nt}")
-        else:
-            wait_state = (r, c, hb, nt)
-            wait_g = g + ASTAR_WAIT_COST
-            if wait_g < g_cost.get(wait_state, float('inf')):
-                g_cost[wait_state]     = wait_g
-                came_from[wait_state]  = state
-                actions[wait_state]    = None
-                state_pose[wait_state] = (x, y, heading)
-                h = (math.hypot(x - staging_pose.x, y - staging_pose.y)
-                     + truck.turn_radius * abs(_angle_diff_signed(staging_pose.heading, heading)))
-                heapq.heappush(open_heap, (wait_g + h, wait_g, r, c, hb, nt))
+        # Wait always costs exactly 1 locked-footprint timestep (1 cell-size of travel).
+        nt_wait = t + 1
+        if nt_wait <= max_time:
+            if _footprints_conflict(x, y, heading, hl, hw, nt_wait, constraints):
+                _n_wait_conflicts += 1
+            else:
+                wait_state = (r, c, hb, nt_wait)
+                wait_g = g + ASTAR_WAIT_COST
+                if wait_g < g_cost.get(wait_state, float('inf')):
+                    g_cost[wait_state]     = wait_g
+                    came_from[wait_state]  = state
+                    actions[wait_state]    = None
+                    state_pose[wait_state] = (x, y, heading)
+                    h = (math.hypot(x - staging_pose.x, y - staging_pose.y)
+                         + truck.turn_radius * abs(_angle_diff_signed(staging_pose.heading, heading)))
+                    heapq.heappush(open_heap, (wait_g + h, wait_g, r, c, hb, nt_wait))
 
         # ── MOVE (3 bicycle primitives) ───────────────────────────────────────────
         for turn in (0, -1, 1):
-            primitive = _hybrid_primitive(grid, truck, driveable, x, y, heading, turn)
-            if not primitive:
+            primitive, travel = _hybrid_primitive(grid, truck, driveable, x, y, heading, turn)
+            if primitive is None:
                 continue
+
+            # Advance the locked-footprint timestep by the arc length of this primitive
+            # measured in cell-size units.  Straight moves: dt=1 (travel==cell_size).
+            # Turning moves for large-radius trucks: dt>1 (travel > cell_size), so the
+            # constraint check uses the temporally correct locked-footprint slot instead
+            # of always checking t+1 regardless of how much distance was covered.
+            dt = max(1, round(travel / grid.cell_size))
+            nt = t + dt
+            if nt > max_time:
+                continue
+
             nx, ny, nh = primitive[-1]
 
             # Full-footprint blocked check against statically blocked footprints.
             if _footprint_blocked(truck, nx, ny, nh, blocked_footprints):
                 continue
 
-            # Full-footprint constraint check — replaces (nr, nc, nt) in constraints.
+            # Full-footprint constraint check at the temporally aligned slot.
             if _footprints_conflict(nx, ny, nh, hl, hw, nt, constraints):
-                print(f"[HYBRID_ST] Truck {truck.id}: MOVE conflict → "
-                      f"({nx:.1f},{ny:.1f}) heading={nh:.2f} t={nt}")
+                _n_move_conflicts += 1
                 continue
 
             nr, nc = grid.world_to_cell(nx, ny)
@@ -309,6 +324,10 @@ def hybrid_astar_to_staging_st(grid, truck, staging_pose, blocked_footprints=(),
                 h = (math.hypot(nx - staging_pose.x, ny - staging_pose.y)
                      + truck.turn_radius * abs(_angle_diff_signed(staging_pose.heading, nh)))
                 heapq.heappush(open_heap, (new_g + h, new_g, nr, nc, nhb, nt))
+
+    if constraints and (_n_wait_conflicts or _n_move_conflicts):
+        print(f"[HYBRID_ST] T{truck.id}: search done — "
+              f"{_n_wait_conflicts} wait-conflict(s), {_n_move_conflicts} move-conflict(s) rejected")
 
     if terminal is None:
         return []

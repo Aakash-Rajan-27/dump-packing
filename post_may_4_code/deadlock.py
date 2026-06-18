@@ -114,6 +114,82 @@ def generate_yield_maneuver(truck, grid, other_truck, num_reverse=5, num_turn=12
     return retreat + turn_poses
 
 
+def generate_deadlock_escape(truck, grid, other_truck, max_steps=28):
+    """
+    Deadlock escape: reverse while arcing ~90° until the truck body is
+    entirely outside the width corridor of `other_truck`.
+
+    Unlike generate_yield_maneuver (which turns forward), this keeps moving
+    backward throughout so the truck never closes distance to the blocker.
+
+    Turn direction is chosen to swing AWAY from the other truck's lateral side.
+    Each candidate step checks all 4 body corners for BOUNDARY/OBSTACLE cells.
+
+    Returns list of (rear_x, rear_y, heading) waypoints, or [] if immediately
+    blocked in all directions.
+    """
+    import grid_map as _gm
+
+    half_len  = truck.length / 2.0
+    half_w    = truck.width  / 2.0
+    other_hw  = other_truck.width / 2.0
+
+    rear_x, rear_y = truck.rear_axle_world()
+
+    # Turn direction: swing body AWAY from the other truck's lateral side.
+    dx    = other_truck.pos[0] - truck.pos[0]
+    dy    = other_truck.pos[1] - truck.pos[1]
+    cross = math.cos(truck.heading) * dy - math.sin(truck.heading) * dx
+    # cross > 0 → other is to LEFT  → escape RIGHT → heading decreases → d_h negative
+    # cross < 0 → other is to RIGHT → escape LEFT  → heading increases → d_h positive
+    turn_sign = -1.0 if cross >= 0.0 else 1.0
+
+    d_h    = turn_sign * (math.pi / 2.0) / max_steps   # heading change per step
+    step_m = max(0.3, grid.cell_size * 0.55)             # ~0.55 cell per step
+
+    def _corners_clear(nx, ny, nh):
+        """Return True if all 4 body corners are in non-obstacle cells."""
+        bx   = nx + math.cos(nh) * half_len
+        by   = ny + math.sin(nh) * half_len
+        hcos = math.cos(nh);  hsin = math.sin(nh)
+        scos = -hsin;         ssin = hcos
+        for ls in (-1, 1):
+            for ws in (-1, 1):
+                cx = bx + ls * half_len * hcos + ws * half_w * scos
+                cy = by + ls * half_len * hsin + ws * half_w * ssin
+                cr, cc = grid.world_to_cell(cx, cy)
+                if not (0 <= cr < grid.rows and 0 <= cc < grid.cols):
+                    return False
+                if grid.state[cr, cc] in (_gm.CellState.BOUNDARY,
+                                          _gm.CellState.OBSTACLE):
+                    return False
+        return True
+
+    waypoints = []
+    rx, ry, rh = rear_x, rear_y, truck.heading
+
+    for _ in range(max_steps):
+        nh = rh + d_h
+        nx = rx - math.cos(rh) * step_m   # backward along current heading
+        ny = ry - math.sin(rh) * step_m
+
+        if not _corners_clear(nx, ny, nh):
+            break
+
+        rx, ry, rh = nx, ny, nh
+        waypoints.append((rx, ry, rh))
+
+        # Done once our body centre clears the other truck's full width + margin
+        bx  = rx + math.cos(rh) * half_len
+        by  = ry + math.sin(rh) * half_len
+        lat = abs((-math.sin(other_truck.heading)) * (bx - other_truck.pos[0])
+                  + math.cos(other_truck.heading)  * (by - other_truck.pos[1]))
+        if lat > half_w + other_hw + 0.5:
+            break
+
+    return waypoints
+
+
 def escape_and_replan_exit(truck, grid, all_trucks, entry_rc):
     """
     Fallback exit planner for a truck that CBS could not route out.

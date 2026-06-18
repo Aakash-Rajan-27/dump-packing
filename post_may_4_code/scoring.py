@@ -68,9 +68,9 @@ def score_candidates(grid, candidate_idxs, state_override=None):
 
     # Adaptive weights based on fill percentage
     fp = grid.fill_pct()
-    if   fp < 0.30: w = WEIGHTS_EARLY
-    elif fp < 0.70: w = WEIGHTS_MID
-    else:           w = WEIGHTS_LATE
+    if   fp < 0.03:  w = WEIGHTS_EARLY   # includes fp==0 (empty polygon)
+    elif fp < 0.1:   w = WEIGHTS_MID
+    else:            w = WEIGHTS_LATE
 
     combined = (w[0] * density_score   +
                 w[1] * coverage_score  +

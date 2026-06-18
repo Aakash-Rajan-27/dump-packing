@@ -18,12 +18,12 @@ from hybrid_astar import hybrid_astar_to_staging, hybrid_astar_to_staging_st
 from conflict_detect import (_detect_first_conflict, _infer_heading_at_t,
                               _build_locked_footprints, _merge_fp_constraints,
                               _footprints_conflict)
-from config import (LOCKED_PATH_HORIZON, CBS_MAX_NODES, ASTAR_MAX_TIME,
-                    ENTRY_CORRIDOR_CELLS)
+from config import (CBS_MAX_NODES, ASTAR_MAX_TIME, ENTRY_CORRIDOR_CELLS)
 
 
 def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_TIME,
-                       ignore_path_reserved=False, precomputed_masks=None):
+                       ignore_path_reserved=False, precomputed_masks=None,
+                       allow_corridor_bypass=True, spatial_only=False):
     """
     CBS-based staging path planner using the bicycle-model A* (hybrid_astar_to_staging_st).
 
@@ -46,6 +46,15 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
             mask_cache[mask_key] = make_driveable_mask(
                 grid, truck, ignore_path_reserved=ignore_path_reserved)
         driveable  = mask_cache[mask_key]
+
+        # Corridor-bypass mask — always ignore PATH_RESERVED so the truck can wait
+        # and then route through a blocked corridor after the other truck has passed.
+        mask_key_ipr = (truck.truck_class, True)
+        if mask_key_ipr not in mask_cache:
+            mask_cache[mask_key_ipr] = make_driveable_mask(
+                grid, truck, ignore_path_reserved=True)
+        driveable_ipr = mask_cache[mask_key_ipr]
+
         truck_cell = _truck_front_cell(grid, truck)
 
         for dr in range(-2, 3):
@@ -56,13 +65,15 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
                 if 0 <= nr < grid.rows and 0 <= nc < grid.cols:
                     if grid.state[nr, nc] != grid_map.CellState.BOUNDARY:
                         driveable[nr, nc, :] = True
+                        driveable_ipr[nr, nc, :] = True
 
         candidates = score_staging_candidates(grid, truck, dump_target,
                                               ignore_path_reserved=ignore_path_reserved)
         agent_info[truck.id] = {
-            'truck':      truck,
-            'driveable':  driveable,
-            'candidates': candidates,
+            'truck':         truck,
+            'driveable':     driveable,
+            'driveable_ipr': driveable_ipr,
+            'candidates':    candidates,
         }
 
     # ── LOW-LEVEL PLANNER ─────────────────────────────────────────────────────────
@@ -85,6 +96,25 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
             )
             if path:
                 return path, candidate
+
+        # Primary plan failed. If temporal footprint constraints exist and corridor
+        # bypass is allowed, try routing through corridor cells (waiting for the
+        # blocking truck to vacate them).  Gate pre-planning disables this so the
+        # entering truck never physically shares cells with an exit corridor.
+        if locked_fp and allow_corridor_bypass:
+            for candidate in ordered:
+                _st_calls[0] += 1
+                path = hybrid_astar_to_staging_st(
+                    grid, info['truck'], candidate,
+                    driveable=info['driveable_ipr'],
+                    constraints=hard,
+                    max_time=max_time,
+                )
+                if path:
+                    print(f"[STAGING] Truck {info['truck'].id}: corridor-bypass plan — "
+                          f"waiting for blocked corridor to clear")
+                    return path, candidate
+
         print(f"[STAGING] Truck {info['truck'].id}: no reachable staging pose")
         return [], None
 
@@ -105,6 +135,11 @@ def plan_staging_paths(grid, assignments, locked_paths=None, max_time=ASTAR_MAX_
                     print(f"[STAGING] {_tag}: spatial ok "
                           f"(spatial_calls={_spa_calls[0]}, st_calls=0, cbs_nodes=0)")
                     return {aid: _p}, {aid: _cand}
+        # Gate pre-planning: spatial-only mode — if spatial fails, return immediately
+        # so the planning thread is never blocked by a slow ST search.
+        if spatial_only:
+            print(f"[STAGING] {_tag}: spatial failed, spatial_only=True — skipping ST")
+            return {aid: []}, {aid: None}
         path, pose = _plan_one(aid, {})
         print(f"[STAGING] {_tag}: spatial failed → ST fallback "
               f"(spatial_calls={_spa_calls[0]}, st_calls={_st_calls[0]}, cbs_nodes=0)")

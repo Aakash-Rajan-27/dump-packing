@@ -246,6 +246,10 @@ def astar_st(driveable, grid, start_rc, goal_rc, truck, fp_constraints,
     closest_node = start_state
     min_dist = math.hypot(start_rc[0] - goal_rc[0], start_rc[1] - goal_rc[1])
 
+    # Conflict counters — accumulated across all expansions; printed once after search.
+    _n_wait_conflicts = 0
+    _n_move_conflicts = 0
+
     while open_heap:
         # Pop the lowest f-cost space-time state
         f, g, r, c, hb, t = heapq.heappop(open_heap)
@@ -294,8 +298,7 @@ def astar_st(driveable, grid, start_rc, goal_rc, truck, fp_constraints,
                     heapq.heappush(open_heap, (wait_g + h, wait_g, r, c, hb, nt))
                     came_from[wait_state] = state
             else:
-                print(f"[ASTAR_ST] Truck {truck.id}: WAIT conflict at ({r},{c}) t={nt} "
-                      f"heading={wh:.2f}")
+                _n_wait_conflicts += 1
 
         # ── MOVE ACTIONS (8-connected via heading buckets) ───────────────────────
         for turn in (-1, 0, 1):
@@ -318,8 +321,7 @@ def astar_st(driveable, grid, start_rc, goal_rc, truck, fp_constraints,
             nwx, nwy = grid.cell_to_world(nr, nc)
             nwh      = _heading_for_bucket(next_hb)
             if _footprints_conflict(nwx, nwy, nwh, hl, hw, nt, fp_constraints):
-                print(f"[ASTAR_ST] Truck {truck.id}: MOVE conflict → ({nr},{nc}) "
-                      f"heading={nwh:.2f} t={nt}")
+                _n_move_conflicts += 1
                 continue
 
             # Turn cost: 0 if straight, arc-length penalty otherwise
@@ -342,6 +344,10 @@ def astar_st(driveable, grid, start_rc, goal_rc, truck, fp_constraints,
 
                 heapq.heappush(open_heap, (new_g + h, new_g, nr, nc, next_hb, nt))
                 came_from[next_state] = state   # record parent
+
+    if fp_constraints and (_n_wait_conflicts or _n_move_conflicts):
+        print(f"[ASTAR_ST] T{truck.id}: search done — "
+              f"{_n_wait_conflicts} wait-conflict(s), {_n_move_conflicts} move-conflict(s) rejected")
 
     # Reconstruct (r, c) path from back-pointers; heading bucket is dropped here
     path, cur = [], closest_node

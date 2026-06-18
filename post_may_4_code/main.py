@@ -25,90 +25,25 @@ from config import (POLYGON_BOUNDARY, ENTRY_POINT, CELL_SIZE,
                     PHEROMONE_DECAY, PHEROMONE_SPREAD_SIGMA,
                     STEPS_PER_TICK, ENTRY_CORRIDOR_CELLS)
 import grid_map
-from pathfinder import (generate_reverse_retreat, generate_yield_maneuver, _make_locked_entry)
+from pathfinder import (generate_reverse_retreat, generate_yield_maneuver,
+                        generate_deadlock_escape, _make_locked_entry)
 from conflict_detect import _rect_overlap_2d, _detect_first_conflict
 from renderer import Renderer
 
 from planning_worker import (_make_grid_snapshot, _make_truck_snapshot,
                              _planning_worker)
 from sim_helpers import (initialise_half_full_dump, _corridor_cells,
-                         build_fleet)
+                         build_fleet, _try_inplace_replan)
 
 
-def _advance_path_to_current(path, truck):
-    """Trim a replanned path to start at or ahead of the truck's current position.
-
-    The planner works from a snapshot taken some ticks ago; the truck has since
-    moved forward.  Returning the path unchanged would cause the truck to drive
-    backward to the stale snapshot position.  We find the closest waypoint and
-    then advance past any waypoints that are still behind the truck's heading.
-    """
-    if not path:
-        return path
-    tx, ty = truck.pos[0], truck.pos[1]
-    cos_h = math.cos(truck.heading)
-    sin_h = math.sin(truck.heading)
-
-    # 1. Find the waypoint closest to the truck's current world position.
-    best_i, best_dist = 0, float('inf')
-    for i, wp in enumerate(path):
-        d = math.hypot(wp[0] - tx, wp[1] - ty)
-        if d < best_dist:
-            best_dist, best_i = d, i
-
-    # 2. Advance past any leading waypoints that are behind the truck (negative
-    #    forward-projection), so we never ask the truck to reverse.
-    while best_i < len(path) - 1:
-        wp = path[best_i]
-        dx, dy = wp[0] - tx, wp[1] - ty
-        if dx * cos_h + dy * sin_h >= 0:
-            break
-        best_i += 1
-
-    return path[best_i:] or path[-1:]
+class _NullRenderer:
+    """Headless stub — no window, no events, never quits."""
+    def check_quit(self): return False
+    def draw(self, trucks, metrics): pass
+    def close(self): pass
 
 
-def _world_path_to_cell_path(path, grid):
-    """Sample a world-coord smooth path at cell-size intervals.
-    Returns [(row, col, heading), ...] usable by _detect_first_conflict."""
-    if not path:
-        return []
-    result = []
-    prev_x, prev_y = float(path[0][0]), float(path[0][1])
-    rc = grid.world_to_cell(prev_x, prev_y)
-    result.append((rc[0], rc[1], float(path[0][2])))
-    accum = 0.0
-    for wp in path[1:]:
-        cx, cy = float(wp[0]), float(wp[1])
-        dist = math.hypot(cx - prev_x, cy - prev_y)
-        accum += dist
-        if accum >= grid.cell_size:
-            accum -= grid.cell_size
-            rc = grid.world_to_cell(cx, cy)
-            result.append((rc[0], rc[1], float(wp[2])))
-        prev_x, prev_y = cx, cy
-    return result
-
-
-def _build_locked_for_replan(trucks, exclude_ids, grid):
-    """Build locked_paths dict for a replan task, excluding trucks being replanned."""
-    locked = {}
-    for ot in trucks:
-        if ot.id in exclude_ids:
-            continue
-        if ot.status == ot.STATUS_NAVIGATING and ot.path:
-            locked[ot.id] = _make_locked_entry(ot, ot.path, ot._dump_ticks_required + 2, grid)
-        elif ot.status == ot.STATUS_EXITING and ot._exit_path:
-            locked[ot.id] = _make_locked_entry(ot, ot._exit_path, 0, grid)
-        elif ot.status in (ot.STATUS_DUMPING, ot.STATUS_REVERSING):
-            rem = max(0, ot._dump_ticks_required - ot._dump_ticks)
-            locked[ot.id] = _make_locked_entry(ot, [], rem + 2)
-        elif ot.status in (ot.STATUS_WAITING, ot.STATUS_ENTERING) and ot._pre_path:
-            locked[ot.id] = _make_locked_entry(ot, ot._pre_path, ot._dump_ticks_required + 2, grid)
-    return locked
-
-
-def run_simulation():
+def run_simulation(headless=False, max_ticks=0):
     print("Initialising grid...")
     grid = grid_map.GridMap(POLYGON_BOUNDARY, CELL_SIZE)
     initialise_half_full_dump(grid)
@@ -125,8 +60,12 @@ def run_simulation():
     corridor_clearance_m = ENTRY_CORRIDOR_CELLS * CELL_SIZE
     truck_map = {t.id: t for t in trucks}
 
-    renderer = Renderer(grid, scale=PYGAME_SCALE)
-    print("Renderer ready — starting simulation loop")
+    if headless:
+        renderer = _NullRenderer()
+        print("Headless mode — starting simulation loop")
+    else:
+        renderer = Renderer(grid, scale=PYGAME_SCALE)
+        print("Renderer ready — starting simulation loop")
 
     # ── Background planning thread ────────────────────────────────────────────
     _work_q   = _queue.Queue()
@@ -163,7 +102,6 @@ def run_simulation():
                 break
 
             if res['type'] == 'idle':
-                _newly_assigned_ids = set()
                 for tid, (path, dp, sp) in res['assignments'].items():
                     t = truck_map.get(tid)
                     _in_flight.discard(tid)
@@ -177,65 +115,12 @@ def run_simulation():
                             grid_map.CellState.RESERVED, grid_map.CellState.FILLED):
                         continue
                     t.set_path(path, dp, grid, staging_pose=sp)
-                    _newly_assigned_ids.add(tid)
-
-                # Trigger replan for all trucks already inside the polygon.
-                # They must now avoid the newly-entered truck's path.
-                if _newly_assigned_ids:
-                    _replan_trucks = [
-                        t for t in trucks
-                        if t.status in (t.STATUS_NAVIGATING, t.STATUS_EXITING)
-                        and t.id not in _newly_assigned_ids
-                        and t.id not in _in_flight
-                    ]
-                    if _replan_trucks:
-                        _replan_ids   = {t.id for t in _replan_trucks}
-                        _locked_replan = {}
-                        for ot in trucks:
-                            if ot.id in _replan_ids:
-                                continue   # these trucks are being replanned
-                            if ot.status == ot.STATUS_NAVIGATING and ot.path:
-                                _locked_replan[ot.id] = _make_locked_entry(
-                                    ot, ot.path, ot._dump_ticks_required + 2, grid)
-                            elif ot.status == ot.STATUS_EXITING and ot._exit_path:
-                                _locked_replan[ot.id] = _make_locked_entry(
-                                    ot, ot._exit_path, 0, grid)
-                            elif ot.status in (ot.STATUS_DUMPING, ot.STATUS_REVERSING):
-                                rem = max(0, ot._dump_ticks_required - ot._dump_ticks)
-                                _locked_replan[ot.id] = _make_locked_entry(
-                                    ot, [], rem + 2)
-                            elif (ot.status in (ot.STATUS_WAITING, ot.STATUS_ENTERING)
-                                  and ot._pre_path):
-                                _locked_replan[ot.id] = _make_locked_entry(
-                                    ot, ot._pre_path, ot._dump_ticks_required + 2, grid)
-
-                        g_snap     = _make_grid_snapshot(grid)
-                        nav_snaps  = [(_make_truck_snapshot(t), t.dump_target)
-                                      for t in _replan_trucks
-                                      if t.status == t.STATUS_NAVIGATING]
-                        exit_snaps = [_make_truck_snapshot(t)
-                                      for t in _replan_trucks
-                                      if t.status == t.STATUS_EXITING]
-
-                        _work_q.put({
-                            'type':            'replan',
-                            'grid_snap':       g_snap,
-                            'entry_rc':        entry_rc,
-                            'nav_assignments': nav_snaps,
-                            'exit_trucks':     exit_snaps,
-                            'locked_paths':    _locked_replan,
-                        })
-                        for t in _replan_trucks:
-                            _in_flight.add(t.id)
-                        print(f"[REPLAN] New truck(s) {sorted(_newly_assigned_ids)} entered — "
-                              f"triggered replan for {sorted(_replan_ids)}")
 
                 if res.get('sim_done'):
                     print(f"\nSimulation complete at tick {tick}!")
                     done = True
 
             elif res['type'] == 'exit':
-                _newly_exit_ids = set()
                 for tid, path in res['paths'].items():
                     t = truck_map.get(tid)
                     _in_flight.discard(tid)
@@ -243,8 +128,10 @@ def run_simulation():
                         continue
                     if path:
                         t.set_exit_path(path, grid)
-                        _newly_exit_ids.add(tid)
-                    elif tid not in _in_flight:
+                        print(f"[EXIT] T{tid}: exit path set ({len(path)} waypoints)")
+                    else:
+                        print(f"[EXIT] T{tid}: CBS returned empty path — posting escape task")
+                    if not path and tid not in _in_flight:
                         # CBS failed — post async escape task rather than blocking Thread 1
                         g_snap    = _make_grid_snapshot(grid)
                         t_snap    = _make_truck_snapshot(t)
@@ -256,76 +143,18 @@ def run_simulation():
                                      'all_trucks':  all_snaps})
                         _in_flight.add(tid)
 
-                # Full replan for all navigating trucks — they must avoid the new exit paths
-                if _newly_exit_ids:
-                    _nav_replan = [
-                        ot for ot in trucks
-                        if ot.status == ot.STATUS_NAVIGATING
-                        and ot.id not in _newly_exit_ids
-                        and ot.id not in _in_flight
-                    ]
-                    if _nav_replan:
-                        _nav_replan_ids = {ot.id for ot in _nav_replan}
-                        _locked_nav = _build_locked_for_replan(trucks, _nav_replan_ids, grid)
-                        g_snap = _make_grid_snapshot(grid)
-                        _work_q.put({
-                            'type':            'replan',
-                            'grid_snap':       g_snap,
-                            'entry_rc':        entry_rc,
-                            'nav_assignments': [(_make_truck_snapshot(ot), ot.dump_target)
-                                                for ot in _nav_replan],
-                            'exit_trucks':     [],
-                            'locked_paths':    _locked_nav,
-                        })
-                        for ot in _nav_replan:
-                            _in_flight.add(ot.id)
-                        print(f"[EXIT] Trucks {sorted(_newly_exit_ids)} got exit paths — "
-                              f"triggered full nav replan for {sorted(_nav_replan_ids)}")
-
             elif res['type'] == 'exit_escape':
                 tid  = res['truck_id']
                 t    = truck_map.get(tid)
                 _in_flight.discard(tid)
                 if t is None or not t.needs_exit_path():
                     continue
-                t.set_exit_path(res.get('path', []), grid)
-
-            elif res['type'] == 'replan':
-                for tid, (path, sp) in res.get('nav_paths', {}).items():
-                    t = truck_map.get(tid)
-                    _in_flight.discard(tid)
-                    if t is None or t.status != t.STATUS_NAVIGATING:
-                        print(f"[REPLAN] T{tid} nav result skipped "
-                              f"(status={t.status if t else 'gone'})")
-                        continue
-                    if path:
-                        # Trim to truck's current position — the snapshot was taken
-                        # ticks ago; applying from path[0] would cause backward movement.
-                        trimmed = _advance_path_to_current(path, t)
-                        t.clear_all_corridors(grid)
-                        t.set_path(trimmed, t.dump_target, grid, staging_pose=sp)
-                        print(f"[REPLAN] T{tid}: nav path updated "
-                              f"({len(trimmed)}/{len(path)} waypoints after trim)")
-                    else:
-                        print(f"[REPLAN] T{tid}: replan returned empty nav path, "
-                              f"keeping old path")
-                for tid, path in res.get('exit_paths', {}).items():
-                    t = truck_map.get(tid)
-                    _in_flight.discard(tid)
-                    if t is None or t.status != t.STATUS_EXITING:
-                        print(f"[REPLAN] T{tid} exit result skipped "
-                              f"(status={t.status if t else 'gone'})")
-                        continue
-                    if path:
-                        # Same trim: discard waypoints already behind the truck.
-                        trimmed = _advance_path_to_current(path, t)
-                        t.clear_all_corridors(grid)
-                        t.set_exit_path(trimmed, grid)
-                        print(f"[REPLAN] T{tid}: exit path updated "
-                              f"({len(trimmed)}/{len(path)} waypoints after trim)")
-                    else:
-                        print(f"[REPLAN] T{tid}: replan returned empty exit path, "
-                              f"keeping old path")
+                ep = res.get('path', [])
+                if ep:
+                    print(f"[EXIT-ESC] T{tid}: escape path set ({len(ep)} waypoints)")
+                else:
+                    print(f"[EXIT-ESC] T{tid}: escape returned empty — T{tid} stuck")
+                t.set_exit_path(ep, grid)
 
             elif res['type'] == 'gate':
                 tid = res['truck_id']
@@ -343,36 +172,6 @@ def run_simulation():
                     continue
                 t.preload_dump_path(path, dp, grid, sp)
                 print(f"[GATE] Pre-planned path applied for T{tid}")
-
-                # Full replan for all trucks inside — route around the incoming truck's path
-                _inside_replan = [
-                    ot for ot in trucks
-                    if ot.status in (ot.STATUS_NAVIGATING, ot.STATUS_EXITING)
-                    and ot.id != tid
-                    and ot.id not in _in_flight
-                ]
-                if _inside_replan:
-                    _inside_replan_ids = {ot.id for ot in _inside_replan}
-                    _locked_gate = _build_locked_for_replan(trucks, _inside_replan_ids, grid)
-                    # Add the incoming truck's pre-path as a hard constraint
-                    _locked_gate[tid] = _make_locked_entry(t, path, t._dump_ticks_required + 2, grid)
-                    g_snap = _make_grid_snapshot(grid)
-                    _work_q.put({
-                        'type':            'replan',
-                        'grid_snap':       g_snap,
-                        'entry_rc':        entry_rc,
-                        'nav_assignments': [(_make_truck_snapshot(ot), ot.dump_target)
-                                            for ot in _inside_replan
-                                            if ot.status == ot.STATUS_NAVIGATING],
-                        'exit_trucks':     [_make_truck_snapshot(ot)
-                                            for ot in _inside_replan
-                                            if ot.status == ot.STATUS_EXITING],
-                        'locked_paths':    _locked_gate,
-                    })
-                    for ot in _inside_replan:
-                        _in_flight.add(ot.id)
-                    print(f"[GATE] T{tid} pre-path applied — "
-                          f"triggered full replan for {sorted(_inside_replan_ids)}")
 
         if done:
             break
@@ -406,11 +205,17 @@ def run_simulation():
                     elif ot.status == ot.STATUS_EXITING and ot._exit_path:
                         locked[ot.id] = _make_locked_entry(ot, ot._exit_path, 0, grid)
                     elif ot.status == ot.STATUS_EXITING:
-                        # Stuck exiting with no path — lock current pose for a generous tail.
-                        locked[ot.id] = _make_locked_entry(ot, [], 30)
+                        locked[ot.id] = _make_locked_entry(ot, [], 0)
                     else:
                         rem = max(0, ot._dump_ticks_required - ot._dump_ticks)
                         locked[ot.id] = _make_locked_entry(ot, [], rem + 2)
+                # Also lock idle trucks physically inside the polygon so the
+                # gate pre-plan routes around them (they have no active path).
+                for ot in trucks:
+                    if ot is next_t or ot.id in locked:
+                        continue
+                    if ot.status == ot.STATUS_IDLE:
+                        locked[ot.id] = _make_locked_entry(ot, [], 5)
 
                 claimed = {t.dump_target for t in trucks if t.dump_target}
 
@@ -423,33 +228,10 @@ def run_simulation():
                 _in_flight.add(next_t.id)
                 print(f"[GATE] Posted pre-planning task for T{next_t.id}")
 
-            # Re-validate pre-path corridor overlap (fast — stays in Thread 1)
-            if next_t._pre_path and _trucks_inside:
-                _pre_corr = {
-                    (r, c) for r, c in _corridor_cells(grid, next_t._pre_path, next_t)
-                    if math.hypot(r - entry_rc[0], c - entry_rc[1]) > ENTRY_CORRIDOR_CELLS
-                }
-                _stale = False
-                for ot in _trucks_inside:
-                    if ot.status == ot.STATUS_NAVIGATING and ot.path:
-                        _oc = {(r, c) for r, c in _corridor_cells(grid, ot.path, ot)
-                               if math.hypot(r - entry_rc[0], c - entry_rc[1]) > ENTRY_CORRIDOR_CELLS}
-                    elif ot.status == ot.STATUS_EXITING and ot._exit_path:
-                        _oc = {(r, c) for r, c in _corridor_cells(grid, ot._exit_path, ot)
-                               if math.hypot(r - entry_rc[0], c - entry_rc[1]) > ENTRY_CORRIDOR_CELLS}
-                    else:
-                        # Truck has no active path (dumping/reversing/stuck waiting for replan).
-                        # Skip it — its position was locked in the CBS planner, so the pre-path
-                        # already routes around it.  Using the expanded corridor here is too
-                        # conservative and creates an infinite stale-cancel loop.
-                        continue
-                    if _pre_corr & _oc:
-                        _stale = True
-                        print(f"[GATE] T{next_t.id} pre-path stale — cancelling.")
-                        break
-                if _stale:
-                    next_t.cancel_preload(grid)
-                    _in_flight.discard(next_t.id)
+            # NOTE: Stale-check removed. CBS already plans temporally (each truck avoids
+            # others at the right time steps). Spatial cell-set comparison was a false
+            # positive — paths share cells at *different* times, which is safe — causing
+            # immediate cancel-replan loops that prevented trucks from ever entering.
 
             # Release truck if gate is clear
             any_transiting = any(t.status in (t.STATUS_ENTERING, t.STATUS_LEAVING)
@@ -457,7 +239,11 @@ def run_simulation():
             _can_enter = next_t._pre_path or not _trucks_inside
             if _can_enter and not any_transiting:
                 entry_x, entry_y = ENTRY_POINT
-                active = [t for t in trucks if t.status not in (t.STATUS_WAITING,)]
+                # Exclude stuck-exiting trucks (no path) from gate-clear check —
+                # they're being replanned and shouldn't block the queue indefinitely.
+                active = [t for t in trucks
+                          if t.status not in (t.STATUS_WAITING,)
+                          and not (t.status == t.STATUS_EXITING and not t._exit_path)]
                 gate_clear = True
                 if active:
                     nearest = min(math.hypot(t.pos[0] - entry_x, t.pos[1] - entry_y)
@@ -470,6 +256,13 @@ def run_simulation():
         # ── EXIT PATH PLANNING ────────────────────────────────────────────────
         need_exit = [t for t in trucks
                      if t.needs_exit_path() and t.id not in _in_flight]
+        if tick % 50 == 0:
+            exiting = [t for t in trucks if t.status == t.STATUS_EXITING]
+            if exiting:
+                print(f"[DBG tick={tick}] exiting={[t.id for t in exiting]} "
+                      f"need_exit={[t.id for t in need_exit]} "
+                      f"in_flight={_in_flight} "
+                      f"pos={[(round(t.pos[0],1), round(t.pos[1],1)) for t in exiting]}")
         if need_exit:
             g_snap = _make_grid_snapshot(grid)
 
@@ -486,11 +279,18 @@ def run_simulation():
                 elif ot.status in (ot.STATUS_WAITING, ot.STATUS_ENTERING) and ot._pre_path:
                     nav_locked[ot.id] = _make_locked_entry(ot, ot._pre_path,
                                                             ot._dump_ticks_required + 2, grid)
-                elif ot.status in (ot.STATUS_DUMPING, ot.STATUS_REVERSING,
-                                   ot.STATUS_EXITING, ot.STATUS_NAVIGATING):
+                elif ot.status in (ot.STATUS_DUMPING, ot.STATUS_REVERSING):
                     rem = max(0, ot._dump_ticks_required - ot._dump_ticks)
-                    tail = rem + 2 if ot.status == ot.STATUS_DUMPING else 30
+                    tail = rem + 2 if ot.status == ot.STATUS_DUMPING else 5
                     nav_locked[ot.id] = _make_locked_entry(ot, [], tail)
+                elif ot.status == ot.STATUS_EXITING:
+                    # Stuck-exiting with no path — tail=0 so exiting trucks can plan around it.
+                    nav_locked[ot.id] = _make_locked_entry(ot, [], 0)
+                elif ot.status == ot.STATUS_NAVIGATING:
+                    nav_locked[ot.id] = _make_locked_entry(ot, [], 3)
+                elif ot.status == ot.STATUS_IDLE:
+                    # Idle truck inside — lock current pos so exit paths route around it.
+                    nav_locked[ot.id] = _make_locked_entry(ot, [], 5)
 
             exit_snaps = [_make_truck_snapshot(t) for t in need_exit]
 
@@ -519,11 +319,20 @@ def run_simulation():
                                                            t._dump_ticks_required + 2, grid)
                 elif t.status == t.STATUS_EXITING and t._exit_path:
                     all_locked[t.id] = _make_locked_entry(t, t._exit_path, 0, grid)
-                elif t.status in (t.STATUS_DUMPING, t.STATUS_REVERSING,
-                                  t.STATUS_EXITING, t.STATUS_NAVIGATING):
-                    rem = max(0, t._dump_ticks_required - t._dump_ticks)
-                    tail = rem + 2 if t.status == t.STATUS_DUMPING else 30
-                    all_locked[t.id] = _make_locked_entry(t, [], tail)
+                elif t.status in (t.STATUS_DUMPING, t.STATUS_REVERSING):
+                    rem  = max(0, t._dump_ticks_required - t._dump_ticks)
+                    all_locked[t.id] = _make_locked_entry(t, [], rem + 2)
+                elif t.status == t.STATUS_NAVIGATING:
+                    # Navigating but no active path — lock briefly.
+                    all_locked[t.id] = _make_locked_entry(t, [], 3)
+                elif t.status == t.STATUS_EXITING:
+                    # Stuck-exiting (no path) — lock ONLY current position (tail=0)
+                    # so idle trucks can wait 1 step and route around rather than deadlocking.
+                    all_locked[t.id] = _make_locked_entry(t, [], 0)
+                elif t.status == t.STATUS_IDLE:
+                    # Other idle truck inside — lock its current position so staging
+                    # paths route around it rather than planning through its body.
+                    all_locked[t.id] = _make_locked_entry(t, [], 5)
 
             claimed = {t.dump_target for t in trucks
                        if t.dump_target and t.id not in idle_ids}
@@ -618,73 +427,47 @@ def run_simulation():
                 'pack%':      f"{cached_pack:.3f}",
             }
             renderer.draw(trucks, metrics)
-            time.sleep(substep_delay)
-
-        # ── FUTURE PATH CONFLICT DETECTION ───────────────────────────────────
-        # Sample each active truck's remaining path at cell-size intervals and
-        # check for future footprint overlaps.  When a conflict is found, both
-        # trucks are immediately submitted for a full replan.
-        _fp_paths = {}
-        _fp_truck_map = {}
-        for _ft in trucks:
-            if _ft.id in _in_flight:
-                continue
-            if _ft.status == _ft.STATUS_NAVIGATING and _ft.path:
-                _cp = _world_path_to_cell_path(_ft.path, grid)
-                if _cp:
-                    _fp_paths[_ft.id] = _cp
-                    _fp_truck_map[_ft.id] = _ft
-            elif _ft.status == _ft.STATUS_EXITING and _ft._exit_path:
-                _cp = _world_path_to_cell_path(_ft._exit_path, grid)
-                if _cp:
-                    _fp_paths[_ft.id] = _cp
-                    _fp_truck_map[_ft.id] = _ft
-
-        if len(_fp_paths) >= 2:
-            _fc = _detect_first_conflict(_fp_paths, truck_map=_fp_truck_map, grid=grid)
-            if _fc is not None:
-                _fc_ai, _fc_aj, _fc_t = _fc[1], _fc[2], _fc[-1]
-                if _fc_ai not in _in_flight and _fc_aj not in _in_flight:
-                    _conflict_ids = {_fc_ai, _fc_aj}
-                    _locked_fc = _build_locked_for_replan(trucks, _conflict_ids, grid)
-                    g_snap = _make_grid_snapshot(grid)
-                    _fc_nav  = [(_make_truck_snapshot(_ft), _ft.dump_target)
-                                for _ft in trucks
-                                if _ft.id in _conflict_ids
-                                and _ft.status == _ft.STATUS_NAVIGATING]
-                    _fc_exit = [_make_truck_snapshot(_ft)
-                                for _ft in trucks
-                                if _ft.id in _conflict_ids
-                                and _ft.status == _ft.STATUS_EXITING]
-                    if _fc_nav or _fc_exit:
-                        _work_q.put({
-                            'type':            'replan',
-                            'grid_snap':       g_snap,
-                            'entry_rc':        entry_rc,
-                            'nav_assignments': _fc_nav,
-                            'exit_trucks':     _fc_exit,
-                            'locked_paths':    _locked_fc,
-                        })
-                        for _cid in _conflict_ids:
-                            _in_flight.add(_cid)
-                        # Stop conflicting trucks in place so they don't advance
-                        # further toward the collision while waiting for the replan.
-                        for _ft in trucks:
-                            if _ft.id not in _conflict_ids:
-                                continue
-                            if _ft.status == _ft.STATUS_NAVIGATING:
-                                _ft.path = []
-                            elif _ft.status == _ft.STATUS_EXITING:
-                                _ft._exit_path = []
-                        print(f"[CONFLICT-DETECT] Future {_fc[0]} conflict T{_fc_ai}↔T{_fc_aj} "
-                              f"at t={_fc_t} — stopped both, instant replan queued")
+            if headless:
+                time.sleep(0.001)   # yield GIL to planning thread
+            else:
+                time.sleep(substep_delay)
 
         # ── PHEROMONE UPDATE ──────────────────────────────────────────────────
         grid.pheromone = 1.0 - (1.0 - grid.pheromone) * PHEROMONE_DECAY
         grid.pheromone = gaussian_filter(grid.pheromone, sigma=PHEROMONE_SPREAD_SIGMA)
         np.clip(grid.pheromone, 0.0, 1.0, out=grid.pheromone)
 
-        # ── DEADLOCK RESOLUTION ───────────────────────────────────────────────
+        # ── PROACTIVE CBS CONFLICT DETECTION + REPLAN ────────────────────────
+        # Convert active truck paths to cell-space and scan for future conflicts.
+        # On the first conflict found, run CBS in-place for the pair so they
+        # replan before they ever physically block each other.
+        _cbs_paths: dict = {}
+        for _t in active_trucks:
+            if _t._conflict_cooldown > 0 or _t.id in _in_flight:
+                continue
+            if _t.status == _t.STATUS_NAVIGATING and _t.path and len(_t.path) > 1:
+                _cbs_paths[_t.id] = [grid.world_to_cell(_wp[0], _wp[1])
+                                     for _wp in _t.path]
+            elif _t.status == _t.STATUS_EXITING and _t._exit_path and len(_t._exit_path) > 1:
+                _cbs_paths[_t.id] = [grid.world_to_cell(_wp[0], _wp[1])
+                                     for _wp in _t._exit_path]
+
+        if len(_cbs_paths) >= 2:
+            _cbs_conflict = _detect_first_conflict(_cbs_paths,
+                                                   truck_map=truck_map, grid=grid)
+            if _cbs_conflict is not None:
+                _cai, _caj = _cbs_conflict[1], _cbs_conflict[2]
+                _cta = truck_map.get(_cai)
+                _ctb = truck_map.get(_caj)
+                if _cta and _ctb:
+                    print(f"[CBS-DETECT] Future conflict T{_cai}↔T{_caj} "
+                          f"at t={_cbs_conflict[-1]} — replanning.")
+                    _try_inplace_replan(_cta, _ctb, grid, entry_rc, trucks)
+
+        # ── DEADLOCK RESOLUTION (TOP PRIORITY) ───────────────────────────────
+        # Two trucks physically jammed: one stays still, the other reverses
+        # while arcing ~90° until its body is clear of the blocker's width.
+        # Falls back to a straight reverse retreat only if the arc is blocked.
         _STUCK_LIMIT = STEPS_PER_TICK * 4
 
         stuck_active = [t for t in active_trucks
@@ -701,48 +484,98 @@ def run_simulation():
                     if _d >= (_ta.length + _tb.length) * 0.5:
                         continue
 
-                    _ret_a = generate_reverse_retreat(_ta, grid, num_steps=6)
-                    _ret_b = generate_reverse_retreat(_tb, grid, num_steps=6)
+                    # Try both orderings; prefer the truck with more remaining
+                    # path (it has farther to go, so giving way costs it less).
+                    _plen_a = (len(_ta.path) if _ta.status == _ta.STATUS_NAVIGATING
+                               else len(_ta._exit_path))
+                    _plen_b = (len(_tb.path) if _tb.status == _tb.STATUS_NAVIGATING
+                               else len(_tb._exit_path))
+                    _candidates = (
+                        [(_ta, _tb), (_tb, _ta)] if _plen_a >= _plen_b
+                        else [(_tb, _ta), (_ta, _tb)]
+                    )
 
-                    def _retreat_ok(truck, retreat, other_dump):
-                        if not retreat:
-                            return False
-                        if other_dump is None:
-                            return True
-                        half = truck.length / 2.0
-                        for wp in retreat:
-                            bx = wp[0] + math.cos(wp[2]) * half
-                            by = wp[1] + math.sin(wp[2]) * half
-                            if grid.world_to_cell(bx, by) == other_dump:
-                                return False
-                        return True
+                    _esc_wps   = []
+                    _reverser  = None
+                    _advancer  = None
+                    for _rev_cand, _adv_cand in _candidates:
+                        _wps = generate_deadlock_escape(_rev_cand, grid, _adv_cand)
+                        if _wps:
+                            _esc_wps  = _wps
+                            _reverser = _rev_cand
+                            _advancer = _adv_cand
+                            break
 
-                    _a_ok = _retreat_ok(_ta, _ret_a, _tb.dump_target)
-                    _b_ok = _retreat_ok(_tb, _ret_b, _ta.dump_target)
+                    if _reverser is not None:
+                        # ── 90° reverse-arc escape ────────────────────────────
+                        print(f"[DEADLOCK] T{_ta.id}↔T{_tb.id}: "
+                              f"T{_reverser.id} executing 90° reverse escape "
+                              f"({len(_esc_wps)} steps).")
+                        if _reverser.status == _reverser.STATUS_NAVIGATING:
+                            _reverser.clear_all_corridors(grid)
+                            if _reverser.dump_target:
+                                grid.unreserve(*_reverser.dump_target)
+                                _reverser.dump_target = None
+                            _reverser.path        = list(_esc_wps)
+                            _reverser.stop_target = None  # → auto IDLE after escape
+                        elif _reverser.status == _reverser.STATUS_EXITING:
+                            _reverser._clear_exit_corridor(grid)
+                            _reverser._exit_path = list(_esc_wps)
+                        _reverser._stuck_substeps    = 0
+                        _reverser._conflict_cooldown = len(_esc_wps) + 6
+                        _advancer._stuck_substeps    = 0
+                        _advancer._conflict_cooldown = max(
+                            _advancer._conflict_cooldown, len(_esc_wps) + 2)
+                        _in_flight.discard(_reverser.id)
+                        _deadlock_handled = True
 
-                    if not _a_ok and not _b_ok:
-                        continue
-
-                    if _a_ok and (not _b_ok or len(_ret_a) >= len(_ret_b)):
-                        _reverser, _retreat_wps = _ta, _ret_a
-                        _advancer = _tb
                     else:
-                        _reverser, _retreat_wps = _tb, _ret_b
-                        _advancer = _ta
+                        # ── Fallback: straight reverse retreat ────────────────
+                        _ret_a = generate_reverse_retreat(_ta, grid, num_steps=6)
+                        _ret_b = generate_reverse_retreat(_tb, grid, num_steps=6)
 
-                    print(f"[DEADLOCK] T{_ta.id}↔T{_tb.id} mutual block. "
-                          f"T{_reverser.id} retreating {len(_retreat_wps)} steps.")
+                        def _retreat_ok(truck, retreat, other_dump):
+                            if not retreat:
+                                return False
+                            if other_dump is None:
+                                return True
+                            half = truck.length / 2.0
+                            for wp in retreat:
+                                bx = wp[0] + math.cos(wp[2]) * half
+                                by = wp[1] + math.sin(wp[2]) * half
+                                if grid.world_to_cell(bx, by) == other_dump:
+                                    return False
+                            return True
 
-                    if _reverser.status == _reverser.STATUS_NAVIGATING:
-                        _reverser.path = _retreat_wps + list(_reverser.path)
-                    elif _reverser.status == _reverser.STATUS_EXITING:
-                        _reverser._exit_path = _retreat_wps + list(_reverser._exit_path)
+                        _a_ok = _retreat_ok(_ta, _ret_a, _tb.dump_target)
+                        _b_ok = _retreat_ok(_tb, _ret_b, _ta.dump_target)
 
-                    _reverser._stuck_substeps    = 0
-                    _reverser._conflict_cooldown = len(_retreat_wps) + 3
-                    _advancer._conflict_cooldown = max(
-                        _advancer._conflict_cooldown, len(_retreat_wps))
-                    _deadlock_handled = True
+                        if not _a_ok and not _b_ok:
+                            continue
+
+                        if _a_ok and (not _b_ok or len(_ret_a) >= len(_ret_b)):
+                            _reverser, _retreat_wps = _ta, _ret_a
+                            _advancer = _tb
+                        else:
+                            _reverser, _retreat_wps = _tb, _ret_b
+                            _advancer = _ta
+
+                        print(f"[DEADLOCK-FALLBACK] T{_ta.id}↔T{_tb.id}: "
+                              f"T{_reverser.id} straight retreat "
+                              f"({len(_retreat_wps)} steps).")
+
+                        if _reverser.status == _reverser.STATUS_NAVIGATING:
+                            _reverser.path = _retreat_wps + list(_reverser.path)
+                        elif _reverser.status == _reverser.STATUS_EXITING:
+                            _reverser._exit_path = (
+                                _retreat_wps + list(_reverser._exit_path))
+
+                        _reverser._stuck_substeps    = 0
+                        _reverser._conflict_cooldown = len(_retreat_wps) + 3
+                        _advancer._conflict_cooldown = max(
+                            _advancer._conflict_cooldown, len(_retreat_wps))
+                        _deadlock_handled = True
+
                     break
                 if _deadlock_handled:
                     break
@@ -853,7 +686,14 @@ def run_simulation():
             else:
                 del _gate_cooldowns[_gid]
 
+        if headless and tick % 100 == 0:
+            statuses = [f"T{t.id}:{t.status}" for t in trucks]
+            print(f"[TICK {tick}] pack={grid.pack_pct()*100:.3f}% | {' '.join(statuses)}")
+
         tick += 1
+        if max_ticks and tick >= max_ticks:
+            print(f"\nReached max_ticks={max_ticks}, stopping.")
+            break
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     _stop_evt.set()
@@ -864,14 +704,22 @@ def run_simulation():
     print(f"Fill %:        {grid.fill_pct()*100:.3f}%")
     print(f"Pack density:  {grid.pack_pct()*100:.3f}%")
 
-    print("\nClose the window to exit.")
-    while not renderer.check_quit():
-        renderer.draw(trucks, {'FINAL': 'done',
-                               'fill%': f"{grid.fill_pct()*100:.3f}",
-                               'pack%': f"{grid.pack_pct()*100:.3f}"})
-        time.sleep(0.1)
-    renderer.close()
+    if not headless:
+        print("\nClose the window to exit.")
+        while not renderer.check_quit():
+            renderer.draw(trucks, {'FINAL': 'done',
+                                   'fill%': f"{grid.fill_pct()*100:.3f}",
+                                   'pack%': f"{grid.pack_pct()*100:.3f}"})
+            time.sleep(0.1)
+        renderer.close()
 
 
 if __name__ == '__main__':
-    run_simulation()
+    import argparse
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument('--headless', action='store_true',
+                     help='Run without pygame rendering (fast, for testing)')
+    _ap.add_argument('--max-ticks', type=int, default=0,
+                     help='Stop after this many ticks (0 = unlimited)')
+    _args = _ap.parse_args()
+    run_simulation(headless=_args.headless, max_ticks=_args.max_ticks)
