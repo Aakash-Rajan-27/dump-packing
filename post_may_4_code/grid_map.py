@@ -252,6 +252,76 @@ class GridMap:
                     self.pheromone[i, j] = 0.0
                 
 
+    def fast_dump_at(self, r, c, volume_m3):
+        """Apply cone geometry to z_height WITHOUT the per-pile relaxation loop.
+        Call relax_all() once after bulk deposition to settle the material."""
+        tan_theta = _TAN_REPOSE
+        r_pile_m  = (3 * volume_m3 / (np.pi * tan_theta)) ** (1/3)
+        r_cells   = r_pile_m / self.cell_size
+
+        rmin = max(0, r - int(math.ceil(r_cells)))
+        rmax = min(self.rows, r + int(math.ceil(r_cells)) + 1)
+        cmin = max(0, c - int(math.ceil(r_cells)))
+        cmax = min(self.cols, c + int(math.ceil(r_cells)) + 1)
+
+        ii = np.arange(rmin, rmax)
+        jj = np.arange(cmin, cmax)
+        II, JJ = np.meshgrid(ii, jj, indexing='ij')
+        dist_m = np.hypot(II - r, JJ - c) * self.cell_size
+        _state_slice = self.state[rmin:rmax, cmin:cmax]
+        cone_mask = (dist_m < r_pile_m) & (
+            (_state_slice != CellState.BOUNDARY) &
+            (_state_slice != CellState.PROTECTED) &
+            (_state_slice != CellState.PATH_RESERVED)
+        )
+        self.z_height[rmin:rmax, cmin:cmax] += np.where(
+            cone_mask, (r_pile_m - dist_m) * tan_theta, 0.0
+        ).astype(np.float32)
+
+    def relax_all(self):
+        """Run angle-of-repose relaxation over the entire grid, then update states.
+        Called once after bulk fast_dump_at initialisation."""
+        max_dz = _TAN_REPOSE * self.cell_size
+        non_rigid = np.isin(self.state, [
+            int(CellState.BOUNDARY), int(CellState.OBSTACLE),
+            int(CellState.PROTECTED), int(CellState.PATH_RESERVED),
+        ])
+
+        for _ in range(60):
+            changed = False
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                # slices for current and neighbour
+                if dr == -1:
+                    cur_r, cur_c   = slice(1, self.rows),   slice(None)
+                    nei_r, nei_c   = slice(0, self.rows-1), slice(None)
+                elif dr == 1:
+                    cur_r, cur_c   = slice(0, self.rows-1), slice(None)
+                    nei_r, nei_c   = slice(1, self.rows),   slice(None)
+                elif dc == -1:
+                    cur_r, cur_c   = slice(None), slice(1, self.cols)
+                    nei_r, nei_c   = slice(None), slice(0, self.cols-1)
+                else:
+                    cur_r, cur_c   = slice(None), slice(0, self.cols-1)
+                    nei_r, nei_c   = slice(None), slice(1, self.cols)
+
+                z_cur  = self.z_height[cur_r, cur_c]
+                z_nei  = self.z_height[nei_r, nei_c]
+                dz     = z_cur - z_nei
+                valid  = (~non_rigid[cur_r, cur_c]) & (~non_rigid[nei_r, nei_c])
+                xfer   = np.where(valid & (dz > max_dz), (dz - max_dz) / 2.0, 0.0)
+                if xfer.any():
+                    self.z_height[cur_r, cur_c] -= xfer
+                    self.z_height[nei_r, nei_c] += xfer
+                    changed = True
+            if not changed:
+                break
+
+        self.z_height = np.maximum(self.z_height, 0.0)
+        for r in range(self.rows):
+            for c in range(self.cols):
+                self._update_state(r, c)
+        self.pheromone[self.z_height > 0] = 0.0
+
     def deposit_trail(self, r, c, radius_cells, strength):
         rad = int(math.ceil(radius_cells))
         r_min = max(0, r - rad);  r_max = min(self.rows, r + rad + 1)

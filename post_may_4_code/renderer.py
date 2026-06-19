@@ -295,7 +295,19 @@ class Renderer:
         pygame.draw.line(self.screen, (60,60,80),
                          (panel_x+8,y),(panel_x+PANEL_W-8,y),1); y += 12
 
+        # Initial terrain spacing — static value computed at generation time
+        avg_sp = metrics.get('_avg_spacing')
+        if avg_sp is not None:
+            sp_lbl = self.font_small.render("Init pile spacing:", True, (160, 210, 160))
+            sp_val = self.font_large.render(f"{avg_sp:.2f} m", True, (100, 255, 140))
+            self.screen.blit(sp_lbl, (panel_x+8, y)); y += 18
+            self.screen.blit(sp_val, (panel_x+8, y)); y += 26
+            pygame.draw.line(self.screen, (60,60,80),
+                             (panel_x+8,y),(panel_x+PANEL_W-8,y),1); y += 8
+
         for key, val in metrics.items():
+            if key.startswith('_'):
+                continue
             lbl   = self.font_small.render(f"{key}:", True, (140,160,180))
             val_s = self.font_small.render(str(val), True, (220,220,255))
             self.screen.blit(lbl,   (panel_x+8,  y))
@@ -334,7 +346,7 @@ class Renderer:
         y += 8
         for txt, col in [
             ("Target:   <5.0m spacing", (100,200,100)),
-            ("Baseline: 7.38m spacing", (200,120, 80)),
+            ("Target:   60% pack dens.", (100,180,220)),
         ]:
             lbl = self.font_small.render(txt, True, col)
             self.screen.blit(lbl,(panel_x+8,y)); y += 18

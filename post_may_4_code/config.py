@@ -140,6 +140,12 @@ WEIGHTS_MID   = (0.3, 0.2, 0.2, 0.1, 0.1, 0.1) #the weights are
 # LATE PHASE: Pure focus on density and surface evenness. Distance doesn't matter anymore.
 WEIGHTS_LATE  = (0.5, 0.0, 0.3, 0.1, 0.1, 0.0)
 
+# ── Pre-fill initialisation ────────────────────────────────
+# Controls the coarse placement grid for the pre-simulation cone dumps.
+# Actual dump positions are jittered so the result looks organic, not grid-like.
+# Volume per dump varies randomly (40–110 m³) for blob-size variety.
+INIT_DUMP_SPACING_M = 5.0
+
 # ── Simulation ─────────────────────────────────────────────
 TICK_DELAY     = 0.05   # seconds between rendered frames
 # FIX: STEPS_PER_TICK was missing — trucks appeared frozen.

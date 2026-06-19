@@ -32,7 +32,7 @@ from renderer import Renderer
 
 from planning_worker import (_make_grid_snapshot, _make_truck_snapshot,
                              _planning_worker)
-from sim_helpers import (initialise_half_full_dump, _corridor_cells,
+from sim_helpers import (initialise_pre_filled_dump, _corridor_cells,
                          build_fleet, _try_inplace_replan)
 
 
@@ -46,7 +46,7 @@ class _NullRenderer:
 def run_simulation(headless=False, max_ticks=0):
     print("Initialising grid...")
     grid = grid_map.GridMap(POLYGON_BOUNDARY, CELL_SIZE)
-    initialise_half_full_dump(grid)
+    _pile_centers, _avg_spacing = initialise_pre_filled_dump(grid)
 
     valid_cells = np.sum(grid.state == grid_map.CellState.EMPTY)
     print(f"Grid: {grid.rows}x{grid.cols} cells, {valid_cells} valid dump cells")
@@ -425,6 +425,7 @@ def run_simulation(headless=False, max_ticks=0):
                 'candidates': len(top_candidates) if top_candidates else '-',
                 'fill%':      f"{cached_fill:.3f}",
                 'pack%':      f"{cached_pack:.3f}",
+                '_avg_spacing': _avg_spacing,
             }
             renderer.draw(trucks, metrics)
             if headless:
