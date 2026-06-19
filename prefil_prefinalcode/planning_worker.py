@@ -130,16 +130,19 @@ def _execute_planning_task(task, result_q):
             extra_st_constraints=extra_st,
             precomputed_masks={(repr_truck.truck_class, False): _fine})
 
+        # Build initial output dict
         out = {}
         for t_snap, dp in assignments_all:
             out[t_snap.id] = (paths.get(t_snap.id, []), dp,
                               staging.get(t_snap.id))
 
+        # Fallback: for trucks with no path, walk down the scored candidate list
+        # and retry with the next-best dump point until one succeeds.
         _MAX_FB = 8
         _claimed_dps = {dp for _, (p, dp, _) in out.items() if p}
         for t_snap, orig_dp in assignments_all:
             if out[t_snap.id][0]:
-                continue
+                continue   # already has a valid path
             print(f"[FALLBACK] T{t_snap.id}: no path to {orig_dp} — trying next-best candidates")
             _claimed_dps.discard(orig_dp)
             _tried = 0
@@ -256,6 +259,8 @@ def _execute_planning_task(task, result_q):
         path = paths.get(t_snap.id, [])
         sp   = staging.get(t_snap.id)
 
+        # Fallback: if first choice had no reachable path, try next-best candidates
+        # from `top` (the full scored list) in score order.
         if not path:
             print(f"[FALLBACK] Gate T{t_snap.id}: no path to {dt} — trying next-best candidates")
             _tried = 0
