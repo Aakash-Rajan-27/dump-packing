@@ -148,3 +148,23 @@ TICK_DELAY     = 0.05   # seconds between rendered frames
 # Increase to 5-8 for faster animation.
 STEPS_PER_TICK = 10
 PYGAME_SCALE   = None   # auto-computed in renderer
+
+# ── Metrics / instrumentation (Phase 0, neural-LNS build) ──
+# Collision-bypass mode.  When False (the default, and the only correct
+# setting for any demo or interactive run) the post-step SAT guard in
+# main.py rolls a truck's move back the instant two bodies overlap, so
+# trucks never visibly pass through each other.
+#
+# When True, that rollback is SKIPPED: bodies are allowed to overlap and
+# each overlap is COUNTED as an "intrusion" instead of being prevented.
+# This is a benchmarking-only setting — it exposes the planner's true
+# underlying conflict rate, which is otherwise invisible because the
+# guard absorbs every near-collision before it can be measured.
+# eval_harness.py (Phase 7) turns this on; nothing else should.
+ALLOW_COLLISION_BYPASS = False
+
+# Directory for per-run .jsonl metric logs (gitignored).
+METRICS_DIR = 'runs'
+# Write a tick row every N ticks (1 = every tick).  Tick rows are the
+# denominator for clean-fraction and per-1000-tick rates.
+METRICS_TICK_EVERY = 1

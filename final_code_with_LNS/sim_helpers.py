@@ -18,14 +18,18 @@ from pathfinder import (plan_staging_paths, plan_paths_cbs, _path_cells, _make_l
 from config import ENTRY_POINT, FLEET_COMPOSITION
 
 
-def initialise_half_full_dump(grid):
+def initialise_half_full_dump(grid, rng=None):
+    """rng: optional seeded random.Random.  Falls back to the global
+    `random` module, which run_simulation() seeds when --seed is given,
+    so terrain generation is reproducible either way."""
+    _rand = rng or random
     target_pack = 0.00
     valid_cells = np.argwhere(
         (grid.state == grid_map.CellState.EMPTY) |
         (grid.state == grid_map.CellState.PARTIAL)
     )
     while grid.pack_pct() < target_pack:
-        r, c = random.choice(valid_cells)
+        r, c = _rand.choice(valid_cells)
         if grid.is_dumpable(r, c):
             grid.dump_at(r, c, volume_m3=10.0)
     print(f"Initial terrain generated. Pack density = {100*grid.pack_pct():.1f}%")

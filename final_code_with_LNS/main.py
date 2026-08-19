@@ -10,9 +10,11 @@
 #   calls — works on frozen snapshots of grid + truck state.
 # ─────────────────────────────────────────────────────────────
 
+import os
 import sys
 import time
 import math
+import random
 import threading
 import queue   as _queue
 import numpy as np
@@ -23,7 +25,11 @@ sys.stdout.reconfigure(encoding='utf-8')
 from config import (POLYGON_BOUNDARY, ENTRY_POINT, CELL_SIZE,
                     FLEET_COMPOSITION, TICK_DELAY, PYGAME_SCALE,
                     PHEROMONE_DECAY, PHEROMONE_SPREAD_SIGMA,
-                    STEPS_PER_TICK, ENTRY_CORRIDOR_CELLS)
+                    STEPS_PER_TICK, ENTRY_CORRIDOR_CELLS,
+                    ALLOW_COLLISION_BYPASS, METRICS_DIR, METRICS_TICK_EVERY)
+# NOTE: imported under an alias — `metrics` is already used below as a
+# local variable name for the renderer HUD dict.
+import metrics as metrics_sink
 import grid_map
 from pathfinder import (generate_reverse_retreat, generate_yield_maneuver,
                         generate_deadlock_escape, _make_locked_entry)
@@ -31,7 +37,7 @@ from conflict_detect import _rect_overlap_2d, _detect_first_conflict
 from renderer import Renderer
 
 from planning_worker import (_make_grid_snapshot, _make_truck_snapshot,
-                             _planning_worker)
+                             _planning_worker, SyncWorkQueue)
 from sim_helpers import (initialise_half_full_dump, _corridor_cells,
                          build_fleet, _try_inplace_replan)
 
@@ -43,7 +49,55 @@ class _NullRenderer:
     def close(self): pass
 
 
-def run_simulation(headless=False, max_ticks=0):
+def run_simulation(headless=False, max_ticks=0, seed=None, metrics_out=None,
+                   allow_collision_bypass=None, sync_planner=False,
+                   fleet=None):
+    """
+    seed                    — seeds random/np.random.  Necessary but NOT
+                              sufficient for reproducibility: the background
+                              planner thread still lands results on
+                              scheduling-dependent ticks.  Pair with
+                              sync_planner=True for an exactly repeatable run.
+    metrics_out             — path to a .jsonl run log (None = no logging).
+    allow_collision_bypass  — override config.ALLOW_COLLISION_BYPASS.  When
+                              True the post-step SAT guard COUNTS body overlaps
+                              instead of rolling them back (benchmark only).
+    sync_planner            — run planning inline instead of on Thread 2.
+                              Deterministic; use for regression/equivalence
+                              checks, not for performance numbers.
+    fleet                   — optional (small, medium, large) override of
+                              config.FLEET_COMPOSITION, for the scalability
+                              sweep (intrusion rate vs truck count).
+    """
+    if fleet is not None:
+        # Mutate in place — sim_helpers imported the same dict object.
+        FLEET_COMPOSITION.update({'small':  fleet[0],
+                                  'medium': fleet[1],
+                                  'large':  fleet[2]})
+        print(f"Fleet override: {fleet[0]}S/{fleet[1]}M/{fleet[2]}L")
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        print(f"Seeded RNG with {seed}")
+
+    bypass = (ALLOW_COLLISION_BYPASS if allow_collision_bypass is None
+              else allow_collision_bypass)
+    if bypass:
+        print("[METRICS] COLLISION BYPASS ON — truck bodies may overlap; "
+              "intrusions will be counted, not prevented.")
+
+    if metrics_out is None and os.environ.get('DUMP_METRICS_OUT'):
+        metrics_out = os.environ['DUMP_METRICS_OUT']
+
+    sink = metrics_sink.MetricsSink(
+        path=metrics_out,
+        run_id=f"seed{seed}_bypass{int(bool(bypass))}",
+        config_snapshot={'seed': seed, 'bypass': bool(bypass),
+                         'fleet': dict(FLEET_COMPOSITION),
+                         'steps_per_tick': STEPS_PER_TICK,
+                         'max_ticks': max_ticks})
+    intrusions = metrics_sink.IntrusionTracker(sink)
+
     print("Initialising grid...")
     grid = grid_map.GridMap(POLYGON_BOUNDARY, CELL_SIZE)
     initialise_half_full_dump(grid)
@@ -67,14 +121,23 @@ def run_simulation(headless=False, max_ticks=0):
         renderer = Renderer(grid, scale=PYGAME_SCALE)
         print("Renderer ready — starting simulation loop")
 
-    # ── Background planning thread ────────────────────────────────────────────
-    _work_q   = _queue.Queue()
+    # ── Planning: background thread, or synchronous for reproducibility ───────
     _result_q = _queue.Queue()
     _stop_evt = threading.Event()
-    _planner  = threading.Thread(target=_planning_worker,
-                                 args=(_work_q, _result_q, _stop_evt),
-                                 daemon=True, name="Planner")
-    _planner.start()
+    if sync_planner:
+        # Deterministic mode — see SyncWorkQueue docstring.  Seeding the RNG
+        # alone does NOT make a run reproducible: with the real thread, which
+        # tick a plan lands on depends on wall-clock scheduling.
+        _work_q  = SyncWorkQueue(_result_q)
+        _planner = None
+        print("[METRICS] SYNC PLANNER — planning runs inline (reproducible, "
+              "not representative of real-time performance).")
+    else:
+        _work_q  = _queue.Queue()
+        _planner = threading.Thread(target=_planning_worker,
+                                    args=(_work_q, _result_q, _stop_evt),
+                                    daemon=True, name="Planner")
+        _planner.start()
 
     # IDs of trucks that have an in-flight planning request (avoid duplicates)
     _in_flight: set = set()
@@ -85,6 +148,11 @@ def run_simulation(headless=False, max_ticks=0):
     tick       = 0
     done       = False
     top_candidates: list = []
+
+    # Metric accumulators (see the PACKING / PATH-EFFICIENCY block below).
+    _driven:    dict = {}   # truck_id -> metres driven on the current path
+    _nav_start: dict = {}   # truck_id -> (x, y) where the current path began
+    _dumped_xy: list = []   # world coords of every completed dump, in order
 
     while not done:
         if renderer.check_quit():
@@ -354,6 +422,16 @@ def run_simulation(headless=False, max_ticks=0):
         cached_pack    = grid.pack_pct() * 100
         active_trucks  = [t for t in trucks if t.status != t.STATUS_WAITING]
 
+        # Truck-pairs whose bodies overlapped during ANY substep of this tick.
+        # Collected across substeps, resolved into open/closed intrusions once
+        # per tick (intrusion durations are measured in ticks, not substeps).
+        _overlap_pairs = set()
+
+        # Status/target snapshot for metric transition detection after the
+        # substep loop (dump completion, path completion).  Done here rather
+        # than inside truck.py so Truck stays untouched.
+        _pre_status = {t.id: (t.status, t.dump_target) for t in trucks}
+
         for substep in range(STEPS_PER_TICK):
             if renderer.check_quit():
                 done = True
@@ -372,35 +450,53 @@ def run_simulation(headless=False, max_ticks=0):
                 # at different times, which is fine.  SAT only fires when bodies
                 # actually intersect, so trucks on non-conflicting paths can pass
                 # by each other without false stops.
-                collided = False
+                collided   = False
+                blocker_id = None
                 _ex, _ey = ENTRY_POINT
                 for other in active_trucks:
                     if other is truck:
                         continue
                     dist = math.hypot(truck.pos[0] - other.pos[0],
                                       truck.pos[1] - other.pos[1])
-                    if dist < (truck.length + other.length) * 0.5:
-                        # Entry corridor is a natural funnel — all trucks must pass
-                        # through the same point.  Skip SAT when either truck is
-                        # within the corridor radius, mirroring what CBS conflict
-                        # detection already does.  Without this, an IDLE truck at
-                        # the entry permanently blocks any EXITING truck from snapping
-                        # home (STUCK-EXIT infinite loop).
-                        if (math.hypot(truck.pos[0] - _ex, truck.pos[1] - _ey)
-                                <= corridor_clearance_m or
-                                math.hypot(other.pos[0] - _ex, other.pos[1] - _ey)
-                                <= corridor_clearance_m):
-                            continue
-                        if not _rect_overlap_2d(
-                                truck.pos[0], truck.pos[1], truck.heading,
-                                truck.length / 2, truck.width / 2,
-                                other.pos[0], other.pos[1], other.heading,
-                                other.length / 2, other.width / 2):
-                            continue
-                        collided = True
-                        break
+                    if dist >= (truck.length + other.length) * 0.5:
+                        continue
+                    if not _rect_overlap_2d(
+                            truck.pos[0], truck.pos[1], truck.heading,
+                            truck.length / 2, truck.width / 2,
+                            other.pos[0], other.pos[1], other.heading,
+                            other.length / 2, other.width / 2):
+                        continue
 
-                if collided:
+                    # ── Real body overlap. ────────────────────────────────
+                    # Recorded for the intrusion metric UNCONDITIONALLY —
+                    # including inside the entry corridor.  The corridor
+                    # exemption below is a planning tolerance, not a claim
+                    # that overlapping bodies there are physically fine, so
+                    # it must not silently hide them from the metric.
+                    # (in_entry_corridor is logged as a field instead, so
+                    # corridor intrusions can be filtered out post-hoc.)
+                    _overlap_pairs.add((min(truck.id, other.id),
+                                        max(truck.id, other.id)))
+
+                    # Entry corridor is a natural funnel — all trucks must pass
+                    # through the same point.  Skip the BLOCK when either truck
+                    # is within the corridor radius, mirroring what CBS conflict
+                    # detection already does.  Without this, an IDLE truck at
+                    # the entry permanently blocks any EXITING truck from snapping
+                    # home (STUCK-EXIT infinite loop).
+                    if (math.hypot(truck.pos[0] - _ex, truck.pos[1] - _ey)
+                            <= corridor_clearance_m or
+                            math.hypot(other.pos[0] - _ex, other.pos[1] - _ey)
+                            <= corridor_clearance_m):
+                        continue
+
+                    collided   = True
+                    blocker_id = other.id
+                    break
+
+                if collided and not bypass:
+                    # ── Normal mode: prevent the overlap (roll the move back).
+                    sink.record_collision_block(tick, truck.id, blocker_id)
                     truck._stuck_substeps += 1
                     truck.pos[0], truck.pos[1] = prev_x, prev_y
                     truck.heading = prev_heading
@@ -412,7 +508,17 @@ def run_simulation(headless=False, max_ticks=0):
                             truck._exit_path[0] != prev_exit_first_wp):
                         truck._exit_path.insert(0, prev_exit_first_wp)
                 else:
+                    # Bypass mode reaches here even when `collided` is True:
+                    # the move stands, the bodies overlap, and the overlap is
+                    # counted above.  _stuck_substeps stays 0 because the truck
+                    # genuinely moved — inflating it would fire the deadlock
+                    # maneuvers for a truck that is not actually stuck.
                     truck._stuck_substeps = 0
+
+                # Path-efficiency accounting: distance actually covered this
+                # substep (0 when the move was rolled back above).
+                _driven[truck.id] = _driven.get(truck.id, 0.0) + math.hypot(
+                    truck.pos[0] - prev_x, truck.pos[1] - prev_y)
 
             metrics = {
                 'tick':       f"{tick}.{substep + 1}/{STEPS_PER_TICK}",
@@ -431,6 +537,45 @@ def run_simulation(headless=False, max_ticks=0):
                 time.sleep(0.001)   # yield GIL to planning thread
             else:
                 time.sleep(substep_delay)
+
+        # ── PACKING / PATH-EFFICIENCY METRICS ─────────────────────────────────
+        for _t in trucks:
+            _was_status, _was_target = _pre_status[_t.id]
+
+            # Started navigating → begin a fresh driven-distance measurement.
+            if (_t.status == _t.STATUS_NAVIGATING
+                    and _was_status != _t.STATUS_NAVIGATING):
+                _driven[_t.id]   = 0.0
+                _nav_start[_t.id] = (_t.pos[0], _t.pos[1])
+
+            # Arrived (NAVIGATING → REVERSING/DUMPING) → log path efficiency.
+            if (_was_status == _t.STATUS_NAVIGATING
+                    and _t.status in (_t.STATUS_REVERSING, _t.STATUS_DUMPING)
+                    and _t.id in _nav_start):
+                _sx, _sy = _nav_start.pop(_t.id)
+                sink.record_path_completed(
+                    tick, _t.id,
+                    driven_m=_driven.get(_t.id, 0.0),
+                    straight_m=math.hypot(_t.pos[0] - _sx, _t.pos[1] - _sy))
+
+            # Dump finished (DUMPING → EXITING) → log it + spacing to the
+            # nearest previously-dumped cell.
+            if (_was_status == _t.STATUS_DUMPING
+                    and _t.status == _t.STATUS_EXITING
+                    and _was_target is not None):
+                _dx, _dy = grid.cell_to_world(*_was_target)
+                _nn = None
+                if _dumped_xy:
+                    _nn = min(math.hypot(_dx - _px, _dy - _py)
+                              for _px, _py in _dumped_xy)
+                _dumped_xy.append((_dx, _dy))
+                sink.record_dump(tick, _t.id, _was_target, _nn)
+
+        # ── INTRUSION BOOKKEEPING ─────────────────────────────────────────────
+        # Open a new intrusion for each newly-overlapping pair, close any that
+        # separated this tick (logged once, with a duration — not once per tick).
+        intrusions.update(tick, _overlap_pairs, truck_map,
+                          ENTRY_POINT, corridor_clearance_m)
 
         # ── PHEROMONE UPDATE ──────────────────────────────────────────────────
         grid.pheromone = 1.0 - (1.0 - grid.pheromone) * PHEROMONE_DECAY
@@ -462,7 +607,13 @@ def run_simulation(headless=False, max_ticks=0):
                 if _cta and _ctb:
                     print(f"[CBS-DETECT] Future conflict T{_cai}↔T{_caj} "
                           f"at t={_cbs_conflict[-1]} — replanning.")
-                    _try_inplace_replan(_cta, _ctb, grid, entry_rc, trucks)
+                    sink.record_conflict_detected(
+                        tick, _cai, _caj, _cbs_conflict[-1], _cbs_conflict[0])
+                    _t_replan = time.perf_counter()
+                    _ok = _try_inplace_replan(_cta, _ctb, grid, entry_rc, trucks)
+                    sink.record_replan(
+                        tick, (_cai, _caj), 'reactive_pair',
+                        time.perf_counter() - _t_replan, bool(_ok))
 
         # ── DEADLOCK RESOLUTION (TOP PRIORITY) ───────────────────────────────
         # Two trucks physically jammed: one stays still, the other reverses
@@ -511,6 +662,8 @@ def run_simulation(headless=False, max_ticks=0):
                         print(f"[DEADLOCK] T{_ta.id}↔T{_tb.id}: "
                               f"T{_reverser.id} executing 90° reverse escape "
                               f"({len(_esc_wps)} steps).")
+                        sink.record_deadlock(tick, _ta.id, _tb.id,
+                                             'reverse_arc', len(_esc_wps))
                         if _reverser.status == _reverser.STATUS_NAVIGATING:
                             _reverser.clear_all_corridors(grid)
                             if _reverser.dump_target:
@@ -563,6 +716,9 @@ def run_simulation(headless=False, max_ticks=0):
                         print(f"[DEADLOCK-FALLBACK] T{_ta.id}↔T{_tb.id}: "
                               f"T{_reverser.id} straight retreat "
                               f"({len(_retreat_wps)} steps).")
+                        sink.record_deadlock(tick, _ta.id, _tb.id,
+                                             'straight_retreat',
+                                             len(_retreat_wps))
 
                         if _reverser.status == _reverser.STATUS_NAVIGATING:
                             _reverser.path = _retreat_wps + list(_reverser.path)
@@ -586,6 +742,7 @@ def run_simulation(headless=False, max_ticks=0):
                          and t.status == t.STATUS_NAVIGATING]
             if stuck_nav:
                 yielder = max(stuck_nav, key=lambda t: len(t.path))
+                sink.record_force_idle(tick, yielder.id)
                 yielder._stuck_substeps    = 0
                 yielder._conflict_cooldown = 3
                 yielder.clear_all_corridors(grid)
@@ -608,6 +765,7 @@ def run_simulation(headless=False, max_ticks=0):
                           and t._exit_path]
             for _st in stuck_exit:
                 print(f"[STUCK-EXIT] T{_st.id} stuck while exiting — clearing path for replan.")
+                sink.record_stuck_exit(tick, _st.id)
                 _st._stuck_substeps    = 0
                 _st._conflict_cooldown = 3
                 _st._clear_exit_corridor(grid)
@@ -658,6 +816,8 @@ def run_simulation(headless=False, max_ticks=0):
 
                 print(f"[HEADLOCK] T{_ta.id}↔T{_tb.id} nose-to-nose. "
                       f"T{_reverser.id} yielding ({len(_yield_wps)} steps).")
+                sink.record_headlock(tick, _ta.id, _tb.id, _reverser.id,
+                                     len(_yield_wps))
 
                 if _reverser.status == _reverser.STATUS_NAVIGATING:
                     _reverser.path = _yield_wps + list(_reverser.path)
@@ -686,6 +846,14 @@ def run_simulation(headless=False, max_ticks=0):
             else:
                 del _gate_cooldowns[_gid]
 
+        if tick % METRICS_TICK_EVERY == 0:
+            sink.record_tick(tick,
+                             fill_pct=cached_fill, pack_pct=cached_pack,
+                             active_trucks=len(active_trucks),
+                             active_intrusions=intrusions.active_count(),
+                             idle=len([t for t in trucks if t.is_idle()]),
+                             in_flight=len(_in_flight))
+
         if headless and tick % 100 == 0:
             statuses = [f"T{t.id}:{t.status}" for t in trucks]
             print(f"[TICK {tick}] pack={grid.pack_pct()*100:.3f}% | {' '.join(statuses)}")
@@ -697,12 +865,25 @@ def run_simulation(headless=False, max_ticks=0):
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     _stop_evt.set()
-    _planner.join(timeout=5.0)
+    if _planner is not None:
+        _planner.join(timeout=5.0)
+
+    intrusions.close_all(tick, truck_map)
+    sink.close(final={'total_ticks': tick,
+                      'final_fill_pct': grid.fill_pct() * 100,
+                      'final_pack_pct': grid.pack_pct() * 100})
 
     print("\n=== Final Results ===")
     print(f"Total ticks:   {tick}")
     print(f"Fill %:        {grid.fill_pct()*100:.3f}%")
     print(f"Pack density:  {grid.pack_pct()*100:.3f}%")
+    if metrics_out:
+        _c = sink.counters
+        print(f"Intrusions:    {_c['intrusions_closed']} "
+              f"({_c['sustained_intrusions']} sustained) | "
+              f"blocks={_c['collision_blocks']} "
+              f"deadlocks={_c['deadlocks']} headlocks={_c['headlocks']}")
+        print(f"Metrics log:   {metrics_out}")
 
     if not headless:
         print("\nClose the window to exit.")
@@ -721,5 +902,39 @@ if __name__ == '__main__':
                      help='Run without pygame rendering (fast, for testing)')
     _ap.add_argument('--max-ticks', type=int, default=0,
                      help='Stop after this many ticks (0 = unlimited)')
+    _ap.add_argument('--seed', type=int, default=None,
+                     help='RNG seed — required for reproducible A/B runs')
+    _ap.add_argument('--metrics-out', type=str, default=None,
+                     help='Write a .jsonl run log to this path')
+    _ap.add_argument('--collision-bypass', action='store_true',
+                     help='BENCHMARK ONLY: let truck bodies overlap and count '
+                          'the intrusions instead of blocking them')
+    _ap.add_argument('--sync-planner', action='store_true',
+                     help='Run planning inline instead of on the background '
+                          'thread. Makes a seeded run exactly reproducible; '
+                          'not representative of real-time performance.')
+    _ap.add_argument('--fleet', type=str, default=None,
+                     help='Fleet override as S,M,L (e.g. "4,3,2") for the '
+                          'scalability sweep')
     _args = _ap.parse_args()
-    run_simulation(headless=_args.headless, max_ticks=_args.max_ticks)
+
+    _fleet = None
+    if _args.fleet:
+        _parts = [int(x) for x in _args.fleet.split(',')]
+        if len(_parts) != 3:
+            _ap.error('--fleet expects three comma-separated ints: S,M,L')
+        _fleet = tuple(_parts)
+
+    _mo = _args.metrics_out
+    if _mo is None and (_args.seed is not None or _args.collision_bypass):
+        # Auto-name a log when the run is clearly a measured one.
+        os.makedirs(METRICS_DIR, exist_ok=True)
+        _mo = os.path.join(
+            METRICS_DIR,
+            f"seed{_args.seed}_bypass{int(_args.collision_bypass)}.jsonl")
+
+    run_simulation(headless=_args.headless, max_ticks=_args.max_ticks,
+                   seed=_args.seed, metrics_out=_mo,
+                   allow_collision_bypass=(True if _args.collision_bypass
+                                           else None),
+                   sync_planner=_args.sync_planner, fleet=_fleet)

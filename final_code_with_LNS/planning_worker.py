@@ -251,6 +251,75 @@ def _execute_planning_task(task, result_q):
 
 
 
+def _run_task_safely(task, result_q):
+    """Execute one planning task, guaranteeing a result is always pushed.
+
+    Shared by the threaded worker and the synchronous queue below so both
+    have identical failure behaviour.
+    """
+    try:
+        _execute_planning_task(task, result_q)
+    except Exception as exc:
+        print(f"[PLANNER] Exception in task '{task.get('type','?')}': {exc}")
+        _traceback.print_exc()
+        # Always push an empty result so _in_flight entries are cleared.
+        # Without this, a crash silently leaves trucks stuck forever.
+        try:
+            ttype = task.get('type', '')
+            if ttype == 'idle':
+                result_q.put({'type': 'idle', 'assignments': {}, 'sim_done': False})
+            elif ttype == 'exit':
+                out = {s.id: [] for s in task.get('exit_trucks', [])}
+                result_q.put({'type': 'exit', 'paths': out})
+            elif ttype == 'gate':
+                snap = task.get('truck_snap')
+                if snap is not None:
+                    result_q.put({'type': 'gate', 'truck_id': snap.id, 'result': None})
+            elif ttype == 'exit_escape':
+                snap = task.get('truck_snap')
+                if snap is not None:
+                    result_q.put({'type': 'exit_escape', 'truck_id': snap.id, 'path': []})
+        except Exception:
+            pass
+
+
+class SyncWorkQueue:
+    """Drop-in stand-in for the work Queue that executes each task
+    IMMEDIATELY on the calling thread instead of handing it to Thread 2.
+
+    Why this exists: with the real background thread, which tick a
+    planning result lands on depends on wall-clock thread scheduling, so
+    two same-seed runs diverge (verified — `idle_trucks` differs by
+    tick ~23).  Seeding the RNG is necessary but NOT sufficient for
+    reproducibility.  This mode removes that last source of variance so
+    a refactor can be checked for exact behavioural equivalence.
+
+    Trade-off: results become available on the same tick they are
+    requested rather than a few ticks later, so this is NOT the mode to
+    take headline performance numbers in — it is for regression and
+    equivalence checking only.
+    """
+
+    def __init__(self, result_q):
+        self._result_q = result_q
+
+    def put(self, task):
+        _run_task_safely(task, self._result_q)
+
+    # API compatibility with queue.Queue for the few methods main.py may use.
+    def task_done(self):
+        pass
+
+    def join(self):
+        pass
+
+    def empty(self):
+        return True
+
+    def qsize(self):
+        return 0
+
+
 def _planning_worker(work_q, result_q, stop_evt):
     """Background planning thread — runs until stop_evt is set."""
     while not stop_evt.is_set():
@@ -259,28 +328,6 @@ def _planning_worker(work_q, result_q, stop_evt):
         except _queue.Empty:
             continue
         try:
-            _execute_planning_task(task, result_q)
-        except Exception as exc:
-            print(f"[PLANNER] Exception in task '{task.get('type','?')}': {exc}")
-            _traceback.print_exc()
-            # Always push an empty result so _in_flight entries are cleared.
-            # Without this, a crash silently leaves trucks stuck forever.
-            try:
-                ttype = task.get('type', '')
-                if ttype == 'idle':
-                    result_q.put({'type': 'idle', 'assignments': {}, 'sim_done': False})
-                elif ttype == 'exit':
-                    out = {s.id: [] for s in task.get('exit_trucks', [])}
-                    result_q.put({'type': 'exit', 'paths': out})
-                elif ttype == 'gate':
-                    snap = task.get('truck_snap')
-                    if snap is not None:
-                        result_q.put({'type': 'gate', 'truck_id': snap.id, 'result': None})
-                elif ttype == 'exit_escape':
-                    snap = task.get('truck_snap')
-                    if snap is not None:
-                        result_q.put({'type': 'exit_escape', 'truck_id': snap.id, 'path': []})
-            except Exception:
-                pass
+            _run_task_safely(task, result_q)
         finally:
             work_q.task_done()
