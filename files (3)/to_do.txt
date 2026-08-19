@@ -1,3 +1,0 @@
-- Add path planning, truck type weights to hungarian algorithm
-- add more trucks, add more types of trucks
-- MAKE THE renderer better lol

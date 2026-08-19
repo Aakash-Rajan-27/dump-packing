@@ -67,13 +67,13 @@ _TAN_REPOSE = math.tan(math.radians(ANGLE_OF_REPOSE))
 TURN_REFINEMENT_ITERATIONS = 5
 TRUCK_MOVE_STEP_M = 0.25
 TURN_LOOKAHEAD_RADIUS_FACTOR = 1.0
-TURN_PATH_TOLERANCE_M = 0.35 
-TURN_MAX_SMOOTH_STEPS = 5000 # safety cap to prevent infinite loops
+TURN_PATH_TOLERANCE_M = 0.35
+TURN_MAX_SMOOTH_STEPS = 1000 # safety cap to prevent infinite loops
 
 # Staging-pose planning. Trucks first drive forward to an outward-facing pose,
 # then reverse in a straight line until the rear is clear of the new pile.
-POSE_HEADING_BUCKETS = 24 # discrete headings for staging pose candidates (e.g. 24 = every 15 degrees)
-STAGING_NUM_ANGLES = 24 #
+POSE_HEADING_BUCKETS = 24 # discrete headings for staging pose candidates (24 = every 15 degrees)
+STAGING_NUM_ANGLES = 24 # number of candidate angles tested around dump target
 STAGING_EXTRA_DISTANCE_M = 3.0 # Additional distance beyond the required dump clearance to encourage more spacious staging poses.
 STAGING_DISTANCE_WEIGHT = 0.10 
 STAGING_HEADING_WEIGHT = 1.0
@@ -90,7 +90,6 @@ CONFIG_MATERIAL_HEIGHT_THRESHOLD = 0.70
 # ── Scoring filter sizes ───────────────────────────────────
 SCORE_FILTER_SIZE    = int(round(24.0 / CELL_SIZE))
 ENTRY_CORRIDOR_CELLS = max(1, int(round(9.0 / CELL_SIZE)))
-ENTRY_EXIT_HOLD_RADIUS_M = 25.0
 
 # ── Pheromone ──────────────────────────────────────────────
 PHEROMONE_DECAY = 0.85
@@ -102,19 +101,26 @@ PHEROMONE_SPREAD_SIGMA = max(1.0, 3.0 / CELL_SIZE)
 TRAIL_STRENGTH  = 0.5
 TRAIL_RADIUS_M  = 3.0
 
+# ── Path separation buffer ─────────────────────────────────
+# Minimum gap (metres) enforced between any two trucks' footprints during
+# planning.  The checking truck's half-dimensions are expanded by this value
+# before every SAT overlap test (Minkowski sum).
+# Keep small: physical safety is already guaranteed by the post-step SAT guard
+# in main.py.  A value of 1.0 required 6.5 m lateral clearance for small trucks
+# (wider than the truck itself), blocking all legitimate parallel-path planning.
+PATH_BUFFER_M = 1
+
 # ── CBS / Space-time A* ────────────────────────────────────
 # Waiting in place costs this many times more than moving one cell.
 # Higher value → planner strongly prefers detours over standing still.
 # Must be > 1.0 to prefer any detour; 4.0 means a 4-cell detour is
 # cheaper than waiting 4 steps.
-ASTAR_WAIT_COST = 4.0
-# When locking other trucks' future positions as space-time constraints,
-# only look this many steps ahead. Beyond the horizon the cell is free,
-# forcing the planner to route around near-future conflicts rather than
-# waiting for the entire remaining path of every other truck to clear.
-LOCKED_PATH_HORIZON = 25
-SPACE_TIME_CONFLICT_TIME_OFFSET = 6
-SPACE_TIME_LENGTH_BUFFER_M = 2.0
+ASTAR_WAIT_COST = 4
+# Max time-steps the space-time A* is allowed to search (controls state space size).
+# 250 → ~48M states; 60 → ~11M states — 4x faster per call.
+ASTAR_MAX_TIME = 150  # increased from 90 — gives space-time A* room to wait out blockers
+# Max CBS nodes to expand before giving up on inter-truck conflict resolution.
+CBS_MAX_NODES = 200
 
 # ── MCTS ───────────────────────────────────────────────────
 MCTS_SIMULATIONS = 200
@@ -125,7 +131,7 @@ W_DISTANCE = 1.0
 W_HEADING  = 0.4
 
 # EARLY PHASE: Massive priority (0.4) on Entry Distance to push trucks to the back.
-WEIGHTS_EARLY = (0, 100, 0, 0, 0, 10)
+WEIGHTS_EARLY = (0, 100, 0, 0, 10, 100)
 
 # MID PHASE: Focus shifts to clustering and filling gaps.
 WEIGHTS_MID   = (0.3, 0.2, 0.2, 0.1, 0.1, 0.1) #the weights are 

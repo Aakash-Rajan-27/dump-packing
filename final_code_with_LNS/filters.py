@@ -35,13 +35,13 @@
 import numpy as np
 from collections import deque
 import shapely
+from scipy.ndimage import binary_dilation
 from grid_map import CellState
 from config import (CELL_SIZE, ENTRY_POINT, DRIVE_CLEARANCE_M,
                     TARGET_PILE_HEIGHT, POSE_HEADING_BUCKETS,
                     STAGING_FOOTPRINT_MARGIN_M)
 
-_BLOCKED = (CellState.BOUNDARY, CellState.FILLED, CellState.OBSTACLE,
-            CellState.RESERVED, CellState.PATH_RESERVED)
+_BLOCKED = (CellState.BOUNDARY, CellState.FILLED, CellState.OBSTACLE, CellState.PATH_RESERVED)
 _BRIDGE_RISK_BLOCKED = (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE)
 
 _HEADING_ANGLES = [
@@ -125,21 +125,29 @@ def make_driveable_mask(grid, truck, ignore_path_reserved=False):
     if ignore_path_reserved and CellState.PATH_RESERVED in blocked_for_base:
         blocked_for_base = [s for s in blocked_for_base if s != CellState.PATH_RESERVED]
 
-    reserved_obstacles = grid.reserved_obstacle_mask(
-        extra_radius_m=max(half_w, half_l))
-    base_ok = ((~np.isin(grid.state, blocked_for_base))
-               & (~reserved_obstacles)
-               & (grid.z_height <= max_escape_height))
+    # Boundary erosion: a cell is "near boundary" if any BOUNDARY cell falls within
+    # the truck's half-width radius. Eroding the polygon by half_w guarantees that the
+    # full path corridor (which marks cells within half_w of the body centre) never
+    # touches or crosses the polygon wall — no shapely needed in the heading loop.
+    half_w_cells = half_w / grid.cell_size
+    half_int     = int(np.ceil(half_w_cells))
+    dr_idx       = np.arange(-half_int, half_int + 1)
+    DC, DR       = np.meshgrid(dr_idx, dr_idx)
+    struct       = np.hypot(DR, DC) <= half_w_cells
+    near_boundary = binary_dilation(grid.state == CellState.BOUNDARY, structure=struct)
+
+    base_ok = (~near_boundary) & (~np.isin(grid.state, blocked_for_base)) & (grid.z_height <= max_escape_height)
 
     rows_arr, cols_arr = np.where(base_ok)
     if len(rows_arr) == 0:
         return mask
 
-    ex, ey     = ENTRY_POINT
     centres_x  = grid.origin[0] + cols_arr * grid.cell_size + grid.cell_size / 2
     centres_y  = grid.origin[1] + rows_arr * grid.cell_size + grid.cell_size / 2
 
-    corner_blocked_states = [CellState.FILLED, CellState.OBSTACLE, CellState.RESERVED]
+    # Heading loop only checks FILLED / OBSTACLE / PATH_RESERVED via fast cell-state
+    # lookup — boundary is already handled by near_boundary above.
+    corner_blocked_states = [CellState.FILLED, CellState.OBSTACLE]
     if not ignore_path_reserved:
         corner_blocked_states.append(CellState.PATH_RESERVED)
 
@@ -150,37 +158,35 @@ def make_driveable_mask(grid, truck, ignore_path_reserved=False):
             corner_x  = centres_x + dx
             corner_y  = centres_y + dy
 
+            # All truck corners must be strictly inside the polygon.
+            # The near_boundary erosion above is an approximation; diagonal polygon
+            # edges can leave cells passable whose truck corners clip outside.
+            heading_fits &= shapely.contains_xy(grid.polygon, corner_x, corner_y)
+
             c_col = np.clip(((corner_x - grid.origin[0]) / grid.cell_size).astype(int), 0, cols - 1)
             c_row = np.clip(((corner_y - grid.origin[1]) / grid.cell_size).astype(int), 0, rows - 1)
 
-            corner_state  = grid.state[c_row, c_col]
-            corner_z      = grid.z_height[c_row, c_col]
+            corner_state = grid.state[c_row, c_col]
+            corner_z     = grid.z_height[c_row, c_col]
+            is_blocked   = np.isin(corner_state, corner_blocked_states) | (corner_z > max_escape_height)
 
-            corner_reserved = reserved_obstacles[c_row, c_col]
-            is_blocked  = (np.isin(corner_state, corner_blocked_states)
-                           | corner_reserved
-                           | (corner_z > max_escape_height))
-            is_boundary = (corner_state == CellState.BOUNDARY)
-
-            heading_fits &= ~(is_blocked | is_boundary)
+            heading_fits &= ~is_blocked
 
         mask[rows_arr[heading_fits], cols_arr[heading_fits], hi] = True
 
     return mask
 
 
-def is_pose_driveable(grid, truck, x, y, heading, margin_m=None):
+def is_pose_driveable(grid, truck, x, y, heading, margin_m=None, ignore_path_reserved=False):
     """Check the exact oriented truck rectangle at a continuous body pose."""
     margin = STAGING_FOOTPRINT_MARGIN_M if margin_m is None else margin_m
     half_w = truck.width / 2.0 + margin
     half_l = truck.length / 2.0 + margin
     hx, hy = np.cos(heading), np.sin(heading)
     sx, sy = -hy, hx
-    reserved_obstacles = grid.reserved_obstacle_mask(
-        extra_radius_m=max(half_w, half_l))
-    center_r, center_c = grid.world_to_cell(x, y)
-    if reserved_obstacles[center_r, center_c]:
-        return False
+
+    blocked = (CellState.FILLED, CellState.OBSTACLE) if ignore_path_reserved \
+              else (CellState.FILLED, CellState.OBSTACLE, CellState.PATH_RESERVED)
 
     for ls in (-1, 1):
         for ws in (-1, 1):
@@ -189,29 +195,34 @@ def is_pose_driveable(grid, truck, x, y, heading, margin_m=None):
             if not shapely.contains_xy(grid.polygon, corner_x, corner_y):
                 return False
             r, c = grid.world_to_cell(corner_x, corner_y)
-            if (grid.state[r, c] in (CellState.FILLED, CellState.OBSTACLE,
-                                     CellState.RESERVED, CellState.PATH_RESERVED)
-                    or reserved_obstacles[r, c]):
+            if grid.state[r, c] in blocked:
                 return False
             if grid.z_height[r, c] > DRIVE_CLEARANCE_M + 0.5:
                 return False
     return True
 
 
-def precompute_coarse_blocked_mask(grid, truck):
-    f = _COARSE_FACTOR
+def _coarse_from_fine(grid, drive_mask_3d):
+    f  = _COARSE_FACTOR
     cr = (grid.rows + f - 1) // f
     cc = (grid.cols + f - 1) // f
-
-    drive_mask_3d = make_driveable_mask(grid, truck)
-    passable_fine = drive_mask_3d.any(axis=2)
-
-    pad_r = cr * f - grid.rows
-    pad_c = cc * f - grid.cols
+    passable_fine   = drive_mask_3d.any(axis=2)
+    pad_r           = cr * f - grid.rows
+    pad_c           = cc * f - grid.cols
     padded_passable = np.pad(passable_fine, ((0, pad_r), (0, pad_c)), constant_values=False)
-
     coarse_passable = padded_passable.reshape(cr, f, cc, f).any(axis=(1, 3))
     return ~coarse_passable
+
+
+def precompute_coarse_blocked_mask(grid, truck):
+    return _coarse_from_fine(grid, make_driveable_mask(grid, truck))
+
+
+def compute_masks(grid, truck, ignore_path_reserved=False):
+    """Return (coarse_blocked, fine_driveable) from a single make_driveable_mask call.
+    Use this in planning tasks to avoid computing the mask twice."""
+    fine = make_driveable_mask(grid, truck, ignore_path_reserved=ignore_path_reserved)
+    return _coarse_from_fine(grid, fine), fine
 
 
 def _has_bridge_risk(grid, r, c):
@@ -265,9 +276,11 @@ def get_raw_candidates(grid, truck):
     # ── VECTORIZED dumpable ──────────────────────────────────────────────────────
     # Was: Python double loop calling is_dumpable() on every cell (~8100 iterations).
     # Now: one numpy boolean expression — mirrors is_dumpable() exactly but runs in C.
+    # PATH_RESERVED cells are *planned route* cells — still valid dump targets.
+    # Excluding them causes get_raw_candidates to return empty when corridors
+    # cover most of the polygon, triggering premature sim_done.
     _not_dumpable_states = (CellState.BOUNDARY, CellState.PROTECTED,
-                            CellState.OBSTACLE, CellState.FILLED, CellState.RESERVED,
-                            CellState.PATH_RESERVED)
+                            CellState.OBSTACLE, CellState.FILLED, CellState.RESERVED)
     dumpable = (~np.isin(grid.state, list(_not_dumpable_states)) &
                 (grid.z_height < TARGET_PILE_HEIGHT))
 

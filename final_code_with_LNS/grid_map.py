@@ -49,13 +49,14 @@ from config import (TARGET_PILE_HEIGHT, DRIVE_CLEARANCE_M,
 
 
 class CellState(IntEnum):
-    BOUNDARY  = 0
-    EMPTY     = 1
-    PARTIAL   = 2
-    FILLED    = 3
-    RESERVED  = 4
-    PROTECTED = 5
-    OBSTACLE  = 6
+    BOUNDARY      = 0
+    EMPTY         = 1
+    PARTIAL       = 2
+    FILLED        = 3
+    RESERVED      = 4
+    PROTECTED     = 5
+    OBSTACLE      = 6
+    PATH_RESERVED = 7  # temporary: marks a planned-path corridor; cleared when truck arrives
 
 
 class GridMap:
@@ -72,6 +73,8 @@ class GridMap:
                                  CellState.BOUNDARY, dtype=np.int8)
         self.z_height  = np.zeros((self.rows, self.cols), dtype=np.float32)
         self.pheromone = np.ones ((self.rows, self.cols), dtype=np.float32)
+
+        self._path_corridors: dict = {}  # key -> list of (r, c, original_state)
 
         self._classify_cells()
         self._mark_entry_corridor()
@@ -99,6 +102,62 @@ class GridMap:
                 if 0 <= nr < self.rows and 0 <= nc < self.cols:
                     if self.state[nr, nc] == CellState.EMPTY:
                         self.state[nr, nc] = CellState.PROTECTED
+
+    # ── PATH CORRIDOR MANAGEMENT ──────────────────────────────────────────────
+    _CORRIDOR_RESTORABLE = frozenset([
+        CellState.EMPTY, CellState.PARTIAL, CellState.RESERVED
+    ])
+
+    def mark_path_corridor(self, key, body_cells, half_w_cells):
+        """Mark a truck-width corridor around body_cells as PATH_RESERVED.
+        Saves original states so clear_path_corridor can restore them.
+        key: unique string (e.g. 'dump_0', 'exit_1') per truck/path."""
+        half = int(math.ceil(half_w_cells))
+        seen = set()
+        candidates = []
+        for (r, c) in body_cells:
+            for dr in range(-half, half + 1):
+                for dc in range(-half, half + 1):
+                    if math.hypot(dr, dc) > half_w_cells:
+                        continue
+                    nr, nc = r + dr, c + dc
+                    if not (0 <= nr < self.rows and 0 <= nc < self.cols):
+                        continue
+                    if (nr, nc) in seen:
+                        continue
+                    seen.add((nr, nc))
+                    candidates.append((nr, nc))
+
+        if not candidates:
+            self._path_corridors[key] = []
+            return
+
+        # Batch polygon check — only mark cells whose centres are inside the
+        # polygon.  This is the definitive guard: even if body cells reach the
+        # polygon edge, the corridor never extends outside it.
+        cxs = np.array([self.origin[0] + nc * self.cell_size + self.cell_size / 2
+                        for _, nc in candidates])
+        cys = np.array([self.origin[1] + nr * self.cell_size + self.cell_size / 2
+                        for nr, _ in candidates])
+        inside = shapely.contains_xy(self.polygon, cxs, cys)
+
+        saved = []
+        for (nr, nc), ok in zip(candidates, inside):
+            if not ok:
+                continue
+            orig = int(self.state[nr, nc])
+            if orig in self._CORRIDOR_RESTORABLE:
+                saved.append((nr, nc, orig))
+                self.state[nr, nc] = CellState.PATH_RESERVED
+        self._path_corridors[key] = saved
+
+    def clear_path_corridor(self, key):
+        """Restore cells that were marked PATH_RESERVED under this key.
+        Safe to call even if the key was never registered."""
+        for r, c, orig in self._path_corridors.pop(key, []):
+            if self.state[r, c] == CellState.PATH_RESERVED:
+                self.state[r, c] = orig
+                self._update_state(r, c)  # reclassify from z_height if EMPTY/PARTIAL
 
     def cell_to_world(self, r, c):
         x = self.origin[0] + c * self.cell_size + self.cell_size / 2
@@ -137,67 +196,85 @@ class GridMap:
         tan_theta = _TAN_REPOSE
         r_pile_m  = (3 * volume_m3 / (np.pi * tan_theta)) ** (1/3)
         r_cells   = r_pile_m / self.cell_size
-        
+
         rmin = max(0, r - int(math.ceil(r_cells)))
         rmax = min(self.rows, r + int(math.ceil(r_cells)) + 1)
         cmin = max(0, c - int(math.ceil(r_cells)))
         cmax = min(self.cols, c + int(math.ceil(r_cells)) + 1)
-        
-        for i in range(rmin, rmax):
-            for j in range(cmin, cmax):
-                if self.state[i, j] == CellState.BOUNDARY:
-                    continue
-                    
-                dist_cells = math.hypot(i - r, j - c)
-                dist_m = dist_cells * self.cell_size
-                
-                if dist_m < r_pile_m:
-                    added_height = (r_pile_m - dist_m) * tan_theta
-                    self.z_height[i, j] += added_height
-                    
+
+        # Vectorized cone deposition — replaces the Python double loop.
+        ii = np.arange(rmin, rmax)
+        jj = np.arange(cmin, cmax)
+        II, JJ = np.meshgrid(ii, jj, indexing='ij')
+        dist_m = np.hypot(II - r, JJ - c) * self.cell_size
+        _state_slice = self.state[rmin:rmax, cmin:cmax]
+        cone_mask = (dist_m < r_pile_m) & (
+            (_state_slice != CellState.BOUNDARY) &
+            (_state_slice != CellState.PROTECTED) &
+            (_state_slice != CellState.PATH_RESERVED)
+        )
+        self.z_height[rmin:rmax, cmin:cmax] += np.where(cone_mask, (r_pile_m - dist_m) * tan_theta, 0.0).astype(np.float32)
+
         max_dz = tan_theta * self.cell_size
-        changed = True
-        
         rx_min, rx_max = max(1, rmin - 4), min(self.rows - 1, rmax + 4)
         cx_min, cx_max = max(1, cmin - 4), min(self.cols - 1, cmax + 4)
-        
-        while changed:
+
+        # Relaxation: cap at 25 passes to prevent unbounded spin on large piles.
+        for _ in range(25):
             changed = False
             for i in range(rx_min, rx_max):
                 for j in range(cx_min, cx_max):
-                    if self.state[i, j] in (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE, CellState.PROTECTED):
+                    if self.state[i, j] in (CellState.FILLED, CellState.BOUNDARY, CellState.OBSTACLE,
+                                              CellState.PROTECTED, CellState.PATH_RESERVED):
                         continue
-                        
+
                     for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                         ni, nj = i + di, j + dj
-                        
-                        if self.state[ni, nj] in (CellState.BOUNDARY, CellState.OBSTACLE, CellState.PROTECTED):
+
+                        if self.state[ni, nj] in (CellState.BOUNDARY, CellState.OBSTACLE,
+                                                   CellState.PROTECTED, CellState.PATH_RESERVED):
                             continue
-                            
+
                         dz = self.z_height[i, j] - self.z_height[ni, nj]
                         if dz > max_dz:
                             transfer = (dz - max_dz) / 2.0
-                            
-                            # THE ANTI-FREEZE FIX: Ignore microscopic dirt movements
-                            if transfer > 0.005: 
+                            if transfer > 0.005:
                                 self.z_height[i, j]   -= transfer
                                 self.z_height[ni, nj] += transfer
                                 changed = True
+            if not changed:
+                break
 
         for i in range(rx_min, rx_max):
             for j in range(cx_min, cx_max):
                 self._update_state(i, j)
                 if self.z_height[i, j] > 0:
                     self.pheromone[i, j] = 0.0
+                
+
+    def deposit_trail(self, r, c, radius_cells, strength):
+        rad = int(math.ceil(radius_cells))
+        r_min = max(0, r - rad);  r_max = min(self.rows, r + rad + 1)
+        c_min = max(0, c - rad);  c_max = min(self.cols, c + rad + 1)
+        rs = np.arange(r_min, r_max)
+        cs = np.arange(c_min, c_max)
+        rr, cc = np.meshgrid(rs, cs, indexing='ij')
+        dist2  = (rr - r) ** 2 + (cc - c) ** 2
+        sigma2 = max(1.0, radius_cells / 2.0) ** 2
+        drop   = strength * np.exp(-dist2 / (2.0 * sigma2)).astype(np.float32)
+        self.pheromone[r_min:r_max, c_min:c_max] = np.maximum(
+            0.0, self.pheromone[r_min:r_max, c_min:c_max] - drop
+        )
 
     def _update_state(self, r, c):
-        if self.state[r, c] in (CellState.BOUNDARY, CellState.PROTECTED, CellState.OBSTACLE, CellState.RESERVED):
+        if self.state[r, c] in (CellState.BOUNDARY, CellState.PROTECTED, CellState.OBSTACLE,
+                                 CellState.RESERVED, CellState.PATH_RESERVED):
             return
             
         z = self.z_height[r, c]
         if z >= TARGET_PILE_HEIGHT:
             self.state[r, c] = CellState.FILLED
-        elif z > 0:
+        elif z > 0.05:
             self.state[r, c] = CellState.PARTIAL
         else:
             self.state[r, c] = CellState.EMPTY
@@ -208,10 +285,12 @@ class GridMap:
 
     def unreserve(self, r, c):
         if self.state[r, c] == CellState.RESERVED:
+            self.state[r, c] = CellState.EMPTY  # clear first so _update_state reclassifies from z_height
             self._update_state(r, c)
 
     def is_dumpable(self, r, c):
         if self.state[r, c] in (CellState.BOUNDARY, CellState.PROTECTED,
-                                 CellState.OBSTACLE, CellState.FILLED):
+                                 CellState.OBSTACLE, CellState.FILLED,
+                                 CellState.RESERVED, CellState.PATH_RESERVED):
             return False
         return self.z_height[r, c] < TARGET_PILE_HEIGHT
