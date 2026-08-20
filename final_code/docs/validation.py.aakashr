@@ -1,0 +1,309 @@
+# validation.py
+# ─────────────────────────────────────────────────────────────
+# Per-frame acceptance-criteria checker.
+#
+# Watches the live simulation every substep and counts violations of
+# the agreed criteria: collisions (SAT), boundary breaches, driving
+# over piles, turn-radius breaches, in-pit teleports, freezes.
+# Also tracks throughput (dumps, trucks inside, idle time) and pile
+# spacing so before/after comparisons are numbers, not impressions.
+#
+# Episode semantics: a violation that persists across consecutive
+# frames counts once (plus a duration in substeps), so one stuck
+# overlap doesn't log thousands of events.
+# ─────────────────────────────────────────────────────────────
+
+import json
+import math
+import os
+import time
+
+import numpy as np
+import shapely
+
+_TRACE = os.environ.get('DUMP_TRACE') == '1'
+
+from config import ENTRY_POINT, MAX_DRIVEOVER_HEIGHT_M
+
+# Gate exemption matches the planner's current rule (pathfinder
+# _truck_inside_boundary skips checks within 20 m of the entry point).
+# Tightened in a later change when the gate corridor is formalised.
+GATE_EXEMPT_RADIUS_M = 20.0
+
+TELEPORT_FLOOR_M     = 3.0    # teleport threshold floor (scaled up by speed*dt)
+FREEZE_SIM_SECONDS   = 10.0   # moving-state truck still this long = frozen
+CURVATURE_TOLERANCE  = 1.10   # +10% slack on 1/turn_radius before flagging
+HEADING_JUMP_EPS     = 0.05   # rad; in-place heading change above this is a spin
+MIN_MOVE_FOR_CURV_M  = 0.05   # below this displacement, check for in-place rotation instead
+STILL_EPS_M          = 0.02   # displacement below this counts as "not moving"
+MAX_EVENTS_STORED    = 400
+
+_MOVING_STATES = ('ENTERING', 'NAVIGATING', 'REVERSING', 'EXITING', 'LEAVING')
+_INSIDE_STATES = ('IDLE', 'NAVIGATING', 'REVERSING', 'DUMPING', 'EXITING')
+
+
+def _angle_diff(a, b):
+    return (a - b + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _rect_corners(cx, cy, heading, half_l, half_w):
+    hc, hs = math.cos(heading), math.sin(heading)
+    sc, ss = -hs, hc
+    return [(cx + ls * half_l * hc + ws * half_w * sc,
+             cy + ls * half_l * hs + ws * half_w * ss)
+            for ls in (-1, 1) for ws in (-1, 1)]
+
+
+def _sat_overlap(c1, c2, h1, h2):
+    """Separating-axis overlap test on two corner lists."""
+    axes = ((math.cos(h1), math.sin(h1)), (-math.sin(h1), math.cos(h1)),
+            (math.cos(h2), math.sin(h2)), (-math.sin(h2), math.cos(h2)))
+    for ax, ay in axes:
+        p1 = [x * ax + y * ay for x, y in c1]
+        p2 = [x * ax + y * ay for x, y in c2]
+        if max(p1) < min(p2) or max(p2) < min(p1):
+            return False
+    return True
+
+
+class Validator:
+    def __init__(self, grid, trucks):
+        self.grid   = grid
+        self.trucks = trucks
+
+        self.counts = {
+            'collision':       0,
+            'boundary':        0,
+            'over_pile':       0,
+            'curvature':       0,
+            'rotate_in_place': 0,
+            'teleport':        0,
+            'freeze':          0,
+        }
+        self.violation_substeps = {k: 0 for k in self.counts}
+        self.events = []                       # capped [(sim_t, tag, detail)]
+
+        self._prev_pose   = {}                 # truck_id -> (x, y, heading)
+        self._prev_status = {t.id: t.status for t in trucks}
+        self._active      = set()              # episode keys violating last frame
+        self._still       = {t.id: 0.0 for t in trucks}   # sim seconds stationary
+        self.max_freeze   = {t.id: 0.0 for t in trucks}   # longest stationary stretch (s)
+
+        self.dumps_completed = 0
+        self.dump_centers    = []              # world (x, y) of each dump target
+        self._substeps       = 0
+        self._inside_total   = 0
+        self._idle_total     = 0
+        self._waiting_total  = 0
+        self._t0             = time.time()
+
+        ex, ey = ENTRY_POINT
+        self._entry = (ex, ey)
+
+    # ── episode bookkeeping ──────────────────────────────────────────────────
+
+    def _flag(self, key, tag, detail, sim_t, now_violating):
+        now_violating.add(key)
+        self.violation_substeps[tag] += 1
+        if key not in self._active:
+            self.counts[tag] += 1
+            if len(self.events) < MAX_EVENTS_STORED:
+                self.events.append((sim_t, tag, detail))
+
+    def _instant(self, tag, detail, sim_t):
+        self.counts[tag] += 1
+        self.violation_substeps[tag] += 1
+        if len(self.events) < MAX_EVENTS_STORED:
+            self.events.append((sim_t, tag, detail))
+
+    # ── per-substep check ────────────────────────────────────────────────────
+
+    def check_substep(self, sim_time, dt):
+        sim_t = f"{sim_time:.1f}s"
+        self._substeps += 1
+        now_violating = set()
+
+        active = [t for t in self.trucks if t.status != 'WAITING']
+        ex, ey = self._entry
+
+        # ---- motion checks (teleport / curvature / freeze) ----
+        for t in active:
+            px, py, ph = self._prev_pose.get(t.id, (t.pos[0], t.pos[1], t.heading))
+            ds = math.hypot(t.pos[0] - px, t.pos[1] - py)
+            dh = abs(_angle_diff(t.heading, ph))
+            # legit per-frame displacement is speed*dt; allow 3x + slack before
+            # calling it a teleport so high multipliers don't false-positive
+            teleport_limit = max(TELEPORT_FLOOR_M, t.speed_mps * dt * 3.0 + 1.0)
+            teleported = ds > teleport_limit
+
+            if t.status in _MOVING_STATES:
+                if teleported:
+                    self._instant('teleport',
+                                  f"T{t.id} jumped {ds:.1f}m during {t.status}", sim_t)
+                else:
+                    if ds >= MIN_MOVE_FOR_CURV_M:
+                        max_dh = ds / max(0.1, t.turn_radius) * CURVATURE_TOLERANCE + 0.02
+                        if dh > max_dh:
+                            self._flag(('curv', t.id), 'curvature',
+                                       f"T{t.id} {dh:.3f}rad over {ds:.2f}m "
+                                       f"(limit {max_dh:.3f}) during {t.status}",
+                                       sim_t, now_violating)
+                    elif dh > HEADING_JUMP_EPS:
+                        self._flag(('spin', t.id), 'rotate_in_place',
+                                   f"T{t.id} rotated {dh:.3f}rad in place during {t.status}",
+                                   sim_t, now_violating)
+
+                # freeze watchdog (sim seconds)
+                if ds < STILL_EPS_M:
+                    before = self._still[t.id]
+                    self._still[t.id] += dt
+                    if before < FREEZE_SIM_SECONDS <= self._still[t.id]:
+                        self._instant('freeze',
+                                      f"T{t.id} stationary {FREEZE_SIM_SECONDS:.0f}s "
+                                      f"during {t.status}", sim_t)
+                    self.max_freeze[t.id] = max(self.max_freeze[t.id], self._still[t.id])
+                else:
+                    self._still[t.id] = 0.0
+            else:
+                self._still[t.id] = 0.0
+
+            self._prev_pose[t.id] = (t.pos[0], t.pos[1], t.heading)
+
+        # Keep WAITING trucks' prev_pose current so the legitimate despawn→queue→
+        # respawn recycle (truck snaps to the outside queue, later re-enters) is
+        # not mistaken for an in-pit teleport on the first ENTERING frame.
+        for t in self.trucks:
+            if t.status == 'WAITING':
+                self._prev_pose[t.id] = (t.pos[0], t.pos[1], t.heading)
+
+        # ---- boundary + over-pile checks (inside the pit, beyond gate zone) ----
+        for t in active:
+            if t.status not in _INSIDE_STATES:
+                continue
+            if math.hypot(t.pos[0] - ex, t.pos[1] - ey) <= GATE_EXEMPT_RADIUS_M:
+                continue
+
+            corners = _rect_corners(t.pos[0], t.pos[1], t.heading,
+                                    t.length / 2.0, t.width / 2.0)
+            xs = np.array([c[0] for c in corners])
+            ys = np.array([c[1] for c in corners])
+            inside = shapely.contains_xy(self.grid.polygon, xs, ys)
+
+            if not inside.all():
+                self._flag(('bound', t.id), 'boundary',
+                           f"T{t.id} corner outside polygon at "
+                           f"({t.pos[0]:.1f},{t.pos[1]:.1f}) during {t.status}",
+                           sim_t, now_violating)
+                continue   # height check meaningless with corners off-grid
+
+            zmax = 0.0
+            for cx, cy in corners + [(t.pos[0], t.pos[1])]:
+                r, c = self.grid.world_to_cell(cx, cy)
+                zmax = max(zmax, float(self.grid.z_height[r, c]))
+            if zmax > MAX_DRIVEOVER_HEIGHT_M:
+                self._flag(('pile', t.id), 'over_pile',
+                           f"T{t.id} on z={zmax:.2f}m material during {t.status}",
+                           sim_t, now_violating)
+                if _TRACE and getattr(t, 'dump_target', None) is not None:
+                    import math as _m
+                    dx, dy = self.grid.cell_to_world(*t.dump_target)
+                    d_own = _m.hypot(t.pos[0] - dx, t.pos[1] - dy)
+                    print(f"[OVERPILE] T{t.id} {t.status} z={zmax:.2f} "
+                          f"dist_to_own_dump={d_own:.1f}m", flush=True)
+
+        # ---- pairwise collision check (SAT, slight shrink vs float noise) ----
+        for i in range(len(active)):
+            for j in range(i + 1, len(active)):
+                a, b = active[i], active[j]
+                centre_d = math.hypot(a.pos[0] - b.pos[0], a.pos[1] - b.pos[1])
+                if centre_d > (a.length + b.length) * 0.5 + 1.0:
+                    continue
+                ca = _rect_corners(a.pos[0], a.pos[1], a.heading,
+                                   a.length / 2.0 - 0.05, a.width / 2.0 - 0.05)
+                cb = _rect_corners(b.pos[0], b.pos[1], b.heading,
+                                   b.length / 2.0 - 0.05, b.width / 2.0 - 0.05)
+                if _sat_overlap(ca, cb, a.heading, b.heading):
+                    self._flag(('coll', a.id, b.id), 'collision',
+                               f"T{a.id}({a.status}) overlaps T{b.id}({b.status}) "
+                               f"centre_d={centre_d:.1f}m", sim_t, now_violating)
+
+        # ---- throughput / utilisation sampling ----
+        self._inside_total  += sum(1 for t in active if t.status in _INSIDE_STATES)
+        self._idle_total    += sum(1 for t in active if t.status == 'IDLE')
+        self._waiting_total += sum(1 for t in self.trucks if t.status == 'WAITING')
+
+        # ---- dump transitions ----
+        for t in self.trucks:
+            prev = self._prev_status.get(t.id)
+            if prev != t.status and _TRACE:
+                print(f"[TRACE {sim_t}] T{t.id} {prev} -> {t.status}")
+            if prev != 'DUMPING' and t.status == 'DUMPING' and t.dump_target:
+                self.dump_centers.append(self.grid.cell_to_world(*t.dump_target))
+            if prev == 'DUMPING' and t.status != 'DUMPING':
+                self.dumps_completed += 1
+            self._prev_status[t.id] = t.status
+
+        self._active = now_violating
+
+    # ── reporting ────────────────────────────────────────────────────────────
+
+    def hud_string(self):
+        c = self.counts
+        return (f"C{c['collision']} B{c['boundary']} P{c['over_pile']} "
+                f"R{c['curvature'] + c['rotate_in_place']} "
+                f"T{c['teleport']} F{c['freeze']}")
+
+    def _spacing_stats(self):
+        if len(self.dump_centers) < 2:
+            return None, None
+        pts = np.array(self.dump_centers)
+        d = np.sqrt(((pts[:, None, :] - pts[None, :, :]) ** 2).sum(axis=2))
+        np.fill_diagonal(d, np.inf)
+        nn = d.min(axis=1)
+        return float(nn.mean()), float(nn.min())
+
+    def finalize(self, ticks, sim_time=0.0, report_path=None):
+        wall = time.time() - self._t0
+        n = max(1, self._substeps)
+        spacing_mean, spacing_min = self._spacing_stats()
+
+        report = {
+            'ticks':                ticks,
+            'sim_seconds':          round(sim_time, 1),
+            'substeps':             self._substeps,
+            'wall_seconds':         round(wall, 1),
+            'violations':           dict(self.counts),
+            'violation_substeps':   dict(self.violation_substeps),
+            'max_freeze_seconds':   {f"T{k}": round(v, 1) for k, v in self.max_freeze.items()},
+            'dumps_completed':      self.dumps_completed,
+            'dump_spacing_mean_m':  spacing_mean,
+            'dump_spacing_min_m':   spacing_min,
+            'avg_trucks_inside':    round(self._inside_total / n, 2),
+            'avg_trucks_idle':      round(self._idle_total / n, 2),
+            'avg_trucks_waiting':   round(self._waiting_total / n, 2),
+            'fill_pct':             round(self.grid.fill_pct() * 100, 3),
+            'pack_pct':             round(self.grid.pack_pct() * 100, 3),
+            'events_sample':        [list(e) for e in self.events[:60]],
+        }
+
+        print("\n=== VALIDATION REPORT ===")
+        print(f"ticks={ticks}  sim_time={sim_time:.1f}s  "
+              f"frames={self._substeps}  wall={wall:.1f}s")
+        print(f"violations: {self.counts}")
+        print(f"dumps completed: {self.dumps_completed}"
+              + (f"  | pile NN spacing mean={spacing_mean:.2f}m min={spacing_min:.2f}m"
+                 if spacing_mean else ""))
+        print(f"avg inside={report['avg_trucks_inside']}  "
+              f"idle={report['avg_trucks_idle']}  waiting={report['avg_trucks_waiting']}")
+        print(f"fill={report['fill_pct']}%  pack={report['pack_pct']}%")
+        if self.events:
+            print("first events:")
+            for sim_t, tag, detail in self.events[:12]:
+                print(f"  [{sim_t}] {tag}: {detail}")
+
+        if report_path:
+            with open(report_path, 'w', encoding='utf-8') as fh:
+                json.dump(report, fh, indent=2)
+            print(f"report written to {report_path}")
+
+        return report
