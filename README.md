@@ -127,7 +127,6 @@ The truck then drives to the chosen staging pose (via hybrid A*), turns to face 
 |---|---|
 | ![Live screenshot of a truck in the REVERSING state, staged just outside its dump target with the clearance circle visible](staging_reversing_live.png) | ![Screenshot showing a truck's purple planned-path corridor curving around and doubling back so the truck can reverse into its dump target](staging_reversing.gif) |
 
-![Staging pose selection + reversing into the dump point — hybrid A* driving to the chosen staging pose, then the straight reverse into the target]()
 
 ### 2.7 Multi-agent path planning: Conflict-Based Search
 
@@ -146,8 +145,6 @@ CBS is complete and returns the optimal conflict-free solution *if* the constrai
 *A real run with a mixed fleet — all three trucks routing simultaneously, each planned by CBS against the others' reserved corridors.*
 
 ![Live screenshot: a single truck's CBS-planned path (purple corridor) threading between multiple existing debris piles](path_planning_avoiding_dumps.gif)
-
-![Path planning routing around existing dump piles — the planner treating already-dumped piles as obstacles and routing corridors around them rather than through them]()
 
 ### 2.8 Deadlock & liveness
 
